@@ -9,6 +9,7 @@ import {
 } from "./lib/memos-cloud-api.js";
 let lastCaptureTime = 0;
 const conversationCounters = new Map();
+const recallCache = new Map();
 const API_KEY_HELP_URL = "https://memos-dashboard.openmem.net/cn/apikeys/";
 const ENV_FILE_SEARCH_HINTS = ["~/.openclaw/.env", "~/.moltbot/.env", "~/.clawdbot/.env"];
 const MEMOS_SOURCE = "openclaw";
@@ -61,60 +62,143 @@ function resolveConversationId(cfg, ctx) {
   return `${prefix}openclaw-${Date.now()}${dynamicSuffix}${suffix}`;
 }
 
+function makeTraceId() {
+  return `memos-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function logEvent(log, level, event, fields = {}) {
+  const entry = { event, ts: new Date().toISOString(), ...fields };
+  const line = `[memos-cloud] ${JSON.stringify(entry)}`;
+  if (level === "warn") {
+    log.warn?.(line);
+    return;
+  }
+  log.info?.(line);
+}
+
+function buildIdentity(cfg, ctx) {
+  const userId = cfg.userId || "openclaw-user";
+  const chatId = ctx?.sessionKey || ctx?.sessionId || "default-chat";
+  const threadId = ctx?.threadId || "";
+  return {
+    tenantId: cfg.tenantId || "default",
+    channel: cfg.channel || "openclaw",
+    chatId,
+    userId,
+    threadId,
+  };
+}
+
+function resolveScopeKey(cfg, ctx) {
+  const id = buildIdentity(cfg, ctx);
+  if (cfg.memoryScopeMode === "user") return `${id.tenantId}:${id.channel}:user:${id.userId}`;
+  if (cfg.memoryScopeMode === "chat") return `${id.tenantId}:${id.channel}:chat:${id.chatId}`;
+  return `${id.tenantId}:${id.channel}:chat:${id.chatId}:user:${id.userId}`;
+}
+
+function resolveSessionId(cfg, ctx) {
+  // Keep read/write path consistent: explicit conversation settings take precedence.
+  const conversationId = resolveConversationId(cfg, ctx);
+  if (conversationId) return conversationId;
+  return resolveScopeKey(cfg, ctx);
+}
+
+function hashStringToBucket(input) {
+  let hash = 0;
+  const text = String(input || "");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return hash % 100;
+}
+
+function isMemoryEnabledForContext(cfg, ctx) {
+  if (!cfg.memoryEnabled) return false;
+  const percent = Number.isFinite(cfg.memoryGrayPercent) ? cfg.memoryGrayPercent : 100;
+  if (percent >= 100) return true;
+  if (percent <= 0) return false;
+  const scopeKey = resolveScopeKey(cfg, ctx);
+  return hashStringToBucket(scopeKey) < percent;
+}
+
+function readRecallCache(key) {
+  const cached = recallCache.get(key);
+  if (!cached) return null;
+  if (cached.expireAt <= Date.now()) {
+    recallCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function writeRecallCache(key, value, ttlSec) {
+  if (!ttlSec || ttlSec <= 0) return;
+  recallCache.set(key, {
+    value,
+    expireAt: Date.now() + ttlSec * 1000,
+  });
+}
+
 function buildSearchPayload(cfg, prompt, ctx) {
   const queryRaw = `${cfg.queryPrefix || ""}${prompt}`;
   const query =
     Number.isFinite(cfg.maxQueryChars) && cfg.maxQueryChars > 0
       ? queryRaw.slice(0, cfg.maxQueryChars)
       : queryRaw;
+  const scopeKey = resolveScopeKey(cfg, ctx);
 
   const payload = {
     user_id: cfg.userId,
     query,
     source: MEMOS_SOURCE,
+    session_id: resolveSessionId(cfg, ctx),
   };
 
-  if (!cfg.recallGlobal) {
-    const conversationId = resolveConversationId(cfg, ctx);
-    if (conversationId) payload.conversation_id = conversationId;
-  }
+  if (!cfg.recallGlobal) payload.session_id = resolveSessionId(cfg, ctx);
 
   if (cfg.filter) payload.filter = cfg.filter;
-  if (cfg.knowledgebaseIds?.length) payload.knowledgebase_ids = cfg.knowledgebaseIds;
+  if (cfg.knowledgebaseIds?.length) payload.readable_cube_ids = cfg.knowledgebaseIds;
 
-  payload.memory_limit_number = cfg.memoryLimitNumber;
+  payload.top_k = cfg.memoryTopK;
   payload.include_preference = cfg.includePreference;
-  payload.preference_limit_number = cfg.preferenceLimitNumber;
-  payload.include_tool_memory = cfg.includeToolMemory;
-  payload.tool_memory_limit_number = cfg.toolMemoryLimitNumber;
+  payload.pref_top_k = cfg.preferenceLimitNumber;
+  payload.search_tool_memory = cfg.includeToolMemory;
+  payload.tool_mem_top_k = cfg.toolMemoryLimitNumber;
   payload.relativity = cfg.relativity;
 
   return payload;
 }
 
 function buildAddMessagePayload(cfg, messages, ctx) {
+  const asyncMode = cfg.memoryWriteAsync ? "async" : "sync";
+  const identity = buildIdentity(cfg, ctx);
   const payload = {
     user_id: cfg.userId,
-    conversation_id: resolveConversationId(cfg, ctx),
+    session_id: resolveSessionId(cfg, ctx),
     messages,
     source: MEMOS_SOURCE,
+    async_mode: asyncMode,
   };
 
-  if (cfg.agentId) payload.agent_id = cfg.agentId;
-  if (cfg.appId) payload.app_id = cfg.appId;
-  if (cfg.tags?.length) payload.tags = cfg.tags;
+  if (cfg.tags?.length) payload.custom_tags = cfg.tags;
+  if (cfg.allowKnowledgebaseIds?.length) payload.writable_cube_ids = cfg.allowKnowledgebaseIds;
 
   const info = {
     source: "openclaw",
     sessionKey: ctx?.sessionKey,
     agentId: ctx?.agentId,
+    tenant_id: identity.tenantId,
+    channel: identity.channel,
+    chat_id: identity.chatId,
+    user_id: identity.userId,
+    thread_id: identity.threadId || undefined,
+    scope_mode: cfg.memoryScopeMode,
+    scope_key: resolveScopeKey(cfg, ctx),
     ...(cfg.info || {}),
   };
+  if (cfg.agentId) info.agent_id = cfg.agentId;
+  if (cfg.appId) info.app_id = cfg.appId;
   if (Object.keys(info).length > 0) payload.info = info;
-
-  payload.allow_public = cfg.allowPublic;
-  if (cfg.allowKnowledgebaseIds?.length) payload.allow_knowledgebase_ids = cfg.allowKnowledgebaseIds;
-  payload.async_mode = cfg.asyncMode;
 
   return payload;
 }
@@ -204,36 +288,77 @@ export default {
 
     api.on("before_agent_start", async (event, ctx) => {
       if (!cfg.recallEnabled) return;
+      if (!isMemoryEnabledForContext(cfg, ctx)) {
+        logEvent(log, "info", "recall.gray_skip", {
+          scope_key: resolveScopeKey(cfg, ctx),
+          memory_gray_percent: cfg.memoryGrayPercent,
+        });
+        return;
+      }
       if (!event?.prompt || event.prompt.length < 3) return;
       if (!cfg.apiKey) {
         warnMissingApiKey(log, "recall");
         return;
       }
+      const traceId = makeTraceId();
+      const startedAt = Date.now();
 
       try {
         const payload = buildSearchPayload(cfg, event.prompt, ctx);
-        const result = await searchMemory(cfg, payload);
-        const promptBlock = formatPromptBlock(result, { 
+        const cacheKey = `${payload.session_id}:${payload.top_k}:${payload.relativity}:${payload.query}`;
+        const cached = readRecallCache(cacheKey);
+        if (cached) {
+          logEvent(log, "info", "recall.cache_hit", {
+            trace_id: traceId,
+            scope_key: payload.session_id,
+          });
+          return { prependContext: cached };
+        }
+
+        const result = await searchMemory(
+          { ...cfg, timeoutMs: cfg.memorySearchTimeoutMs, retries: 0 },
+          payload,
+        );
+        const promptBlock = formatPromptBlock(result, {
           wrapTagBlocks: true,
-          relativity: payload.relativity 
+          relativity: payload.relativity,
+          maxOutputChars: cfg.memoryBudgetTokens * 4,
         });
         if (!promptBlock) return;
+        writeRecallCache(cacheKey, promptBlock, cfg.memoryCacheTtlSec);
+
+        logEvent(log, "info", "recall.success", {
+          trace_id: traceId,
+          cost_ms: Date.now() - startedAt,
+          scope_key: payload.session_id,
+          prompt_chars: promptBlock.length,
+          cache_ttl_sec: cfg.memoryCacheTtlSec,
+        });
 
         return {
           prependContext: promptBlock,
         };
       } catch (err) {
-        log.warn?.(`[memos-cloud] recall failed: ${String(err)}`);
+        logEvent(log, "warn", "recall.failed", {
+          trace_id: traceId,
+          cost_ms: Date.now() - startedAt,
+          degrade: cfg.memoryDegradeOnError,
+          error: String(err),
+        });
+        if (!cfg.memoryDegradeOnError) throw err;
       }
     });
 
     api.on("agent_end", async (event, ctx) => {
       if (!cfg.addEnabled) return;
+      if (!isMemoryEnabledForContext(cfg, ctx)) return;
       if (!event?.success || !event?.messages?.length) return;
       if (!cfg.apiKey) {
         warnMissingApiKey(log, "add");
         return;
       }
+      const traceId = makeTraceId();
+      const startedAt = Date.now();
 
       const now = Date.now();
       if (cfg.throttleMs && now - lastCaptureTime < cfg.throttleMs) {
@@ -250,9 +375,25 @@ export default {
         if (!messages.length) return;
 
         const payload = buildAddMessagePayload(cfg, messages, ctx);
-        await addMessage(cfg, payload);
+        await addMessage(
+          { ...cfg, retries: cfg.memoryWriteRetry },
+          payload,
+        );
+        logEvent(log, "info", "add.success", {
+          trace_id: traceId,
+          cost_ms: Date.now() - startedAt,
+          scope_key: payload.session_id,
+          async_mode: payload.async_mode,
+          message_count: messages.length,
+        });
       } catch (err) {
-        log.warn?.(`[memos-cloud] add failed: ${String(err)}`);
+        logEvent(log, "warn", "add.failed", {
+          trace_id: traceId,
+          cost_ms: Date.now() - startedAt,
+          degrade: cfg.memoryDegradeOnError,
+          error: String(err),
+        });
+        if (!cfg.memoryDegradeOnError) throw err;
       }
     });
   },
