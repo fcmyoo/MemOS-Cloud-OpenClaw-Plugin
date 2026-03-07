@@ -3,6 +3,7 @@
   "version": "0.1.7",
   "description": "OpenClaw lifecycle plugin for MemOS Cloud (add + recall memory)",
   "scripts": {
+    "test": "node --test",
     "sync-version": "node scripts/sync-version.js",
     "version": "npm run sync-version && git add openclaw.plugin.json moltbot.plugin.json clawdbot.plugin.json",
     "publish-beta": "npm publish --tag beta",

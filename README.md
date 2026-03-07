@@ -56,7 +56,7 @@ Restart the gateway after config changes.
 
 ## Environment Variables
 The plugin tries env files in order (**openclaw → moltbot → clawdbot**). For each key, the first file with a value wins.
-If none of these files exist (or the key is missing), it falls back to the process environment.
+If a key is missing from all env files, it falls back to the process environment for that key.
 
 **Where to configure**
 - Files (priority order):
