@@ -51,7 +51,13 @@ function initLanceDB(cfg) {
   lancedbInitialized = true;
 
   const lancedbConfig = cfg.lancedb;
-  const isExplicitlyDisabled = lancedbConfig?.enabled === false;
+
+  // Guard: if lancedb config is not provided at all, skip silently
+  if (!lancedbConfig) {
+    return false;
+  }
+
+  const isExplicitlyDisabled = lancedbConfig.enabled === false;
 
   if (isExplicitlyDisabled) {
     return false;
@@ -59,7 +65,7 @@ function initLanceDB(cfg) {
 
   // Auto-enable: if embedder API key is available, turn on LanceDB
   const hasEmbedderKey = Boolean(
-    lancedbConfig?.embedder?.apiKey ||
+    lancedbConfig.embedder?.apiKey ||
     process.env.OPENAI_API_KEY ||
     process.env.LANCEDB_EMBED_API_KEY
   );
