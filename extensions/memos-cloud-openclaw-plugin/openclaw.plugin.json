@@ -161,8 +161,8 @@
         "properties": {
           "enabled": {
             "type": "boolean",
-            "default": false,
-            "description": "Enable LanceDB hybrid retrieval as precision layer"
+            "default": true,
+            "description": "Enable LanceDB hybrid retrieval as precision layer (auto-enabled when embedder API key is present)"
           },
           "dbPath": {
             "type": "string",

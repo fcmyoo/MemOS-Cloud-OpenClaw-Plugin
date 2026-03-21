@@ -41,30 +41,56 @@ const MEMOS_SOURCE = "openclaw";
 /**
  * Lazily initialize LanceDB retriever from plugin config.
  * Returns true if LanceDB is enabled and initialized.
+ *
+ * Auto-enables when:
+ * - lancedb.enabled is not explicitly false, AND
+ * - An embedder API key is available (from config, or env var)
  */
 function initLanceDB(cfg) {
   if (lancedbInitialized) return lancedbRetriever !== null;
   lancedbInitialized = true;
 
   const lancedbConfig = cfg.lancedb;
-  if (!lancedbConfig?.enabled) {
+  const isExplicitlyDisabled = lancedbConfig?.enabled === false;
+
+  if (isExplicitlyDisabled) {
+    return false;
+  }
+
+  // Auto-enable: if embedder API key is available, turn on LanceDB
+  const hasEmbedderKey = Boolean(
+    lancedbConfig?.embedder?.apiKey ||
+    process.env.OPENAI_API_KEY ||
+    process.env.LANCEDB_EMBED_API_KEY
+  );
+
+  if (!hasEmbedderKey) {
     return false;
   }
 
   try {
     const embedder = createEmbedder({
       apiKey: lancedbConfig.embedder?.apiKey
-        || lancedbConfig.embedderApiKey
-        || process.env.OPENAI_API_KEY
-        || process.env.LANCEDB_EMBED_API_KEY,
-      model: lancedbConfig.embedder?.model || "text-embedding-3-small",
-      baseURL: lancedbConfig.embedder?.baseURL,
-      dimensions: lancedbConfig.embedder?.dimensions,
+        || process.env.LANCEDB_EMBED_API_KEY
+        || process.env.OPENAI_API_KEY,
+      model: lancedbConfig.embedder?.model || "BAAI/bge-m3",
+      baseURL: lancedbConfig.embedder?.baseURL
+        || process.env.LANCEDB_EMBED_BASE_URL
+        || "https://api.siliconflow.cn/v1",
+      dimensions: lancedbConfig.embedder?.dimensions || 1024,
       taskQuery: lancedbConfig.embedder?.taskQuery,
-      normalized: lancedbConfig.embedder?.normalized,
+      normalized: lancedbConfig.embedder?.normalized ?? true,
     });
 
-    lancedbRetriever = createRetriever(lancedbConfig, embedder);
+    lancedbRetriever = createRetriever(
+      {
+        ...lancedbConfig,
+        rerankApiKey: lancedbConfig.rerankApiKey
+          || process.env.JINA_RERANK_API_KEY
+          || process.env.LANCEDB_RERANK_API_KEY,
+      },
+      embedder,
+    );
     return true;
   } catch (err) {
     console.warn(`[memos-cloud] LanceDB init failed: ${err.message}`);
