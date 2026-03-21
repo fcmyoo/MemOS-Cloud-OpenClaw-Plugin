@@ -98,20 +98,6 @@ function initLanceDB(cfg) {
   }
 }
 
-/** Resolve LanceDB DB path from config */
-function resolveLanceDBPath(cfg) {
-  const lancedbConfig = cfg.lancedb;
-  if (!lancedbConfig) return null;
-
-  if (lancedbConfig.dbPath) return lancedbConfig.dbPath;
-  if (process.env.LANCEDB_DB_PATH) return process.env.LANCEDB_DB_PATH;
-
-  // Default path
-  const { homedir } = await import("node:os");
-  const { join } = await import("node:path");
-  return join(homedir(), ".openclaw", "memory", "memos-lancedb");
-}
-
 // ── MemOS Core Utilities ─────────────────────────────────────────────────────
 
 function warnMissingApiKey(log, context) {
