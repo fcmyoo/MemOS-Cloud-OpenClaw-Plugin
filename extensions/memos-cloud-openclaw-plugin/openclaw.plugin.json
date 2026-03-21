@@ -1,0 +1,285 @@
+{
+  "id": "memos-cloud-openclaw-plugin",
+  "name": "MemOS Cloud OpenClaw Plugin",
+  "description": "MemOS Cloud recall + add memory via lifecycle hooks",
+  "version": "0.1.7",
+  "kind": "lifecycle",
+  "main": "./index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "MemOS Cloud base URL"
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "MemOS API Key (Token auth; supports ~/.openclaw/.env, ~/.moltbot/.env, ~/.clawdbot/.env; falls back to process env)"
+      },
+      "userId": {
+        "type": "string",
+        "description": "MemOS user_id (default: openclaw-user)",
+        "default": "openclaw-user"
+      },
+      "conversationId": {
+        "type": "string",
+        "description": "Override conversation_id"
+      },
+      "conversationIdPrefix": {
+        "type": "string",
+        "description": "conversation_id prefix"
+      },
+      "conversationIdSuffix": {
+        "type": "string",
+        "description": "conversation_id suffix"
+      },
+      "conversationSuffixMode": {
+        "type": "string",
+        "enum": [
+          "none",
+          "counter"
+        ],
+        "default": "none"
+      },
+      "resetOnNew": {
+        "type": "boolean",
+        "default": true
+      },
+      "queryPrefix": {
+        "type": "string",
+        "description": "Prefix added to search queries"
+      },
+      "maxQueryChars": {
+        "type": "integer",
+        "description": "Max chars for search query"
+      },
+      "recallEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "recallGlobal": {
+        "type": "boolean",
+        "default": true
+      },
+      "addEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "captureStrategy": {
+        "type": "string",
+        "enum": [
+          "last_turn",
+          "full_session"
+        ],
+        "default": "last_turn"
+      },
+      "maxMessageChars": {
+        "type": "integer",
+        "description": "Max chars per message when adding",
+        "default": 20000
+      },
+      "includeAssistant": {
+        "type": "boolean",
+        "default": true
+      },
+      "memoryLimitNumber": {
+        "type": "integer",
+        "default": 6
+      },
+      "preferenceLimitNumber": {
+        "type": "integer",
+        "default": 6
+      },
+      "includePreference": {
+        "type": "boolean",
+        "default": true
+      },
+      "includeToolMemory": {
+        "type": "boolean",
+        "default": false
+      },
+      "toolMemoryLimitNumber": {
+        "type": "integer",
+        "default": 6
+      },
+      "filter": {
+        "type": "object",
+        "description": "MemOS search filter"
+      },
+      "knowledgebaseIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "info": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "agentId": {
+        "type": "string"
+      },
+      "appId": {
+        "type": "string"
+      },
+      "allowPublic": {
+        "type": "boolean",
+        "default": false
+      },
+      "allowKnowledgebaseIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "asyncMode": {
+        "type": "boolean",
+        "default": true
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "default": 5000
+      },
+      "retries": {
+        "type": "integer",
+        "default": 1
+      },
+      "throttleMs": {
+        "type": "integer",
+        "default": 0
+      },
+      "lancedb": {
+        "type": "object",
+        "description": "LanceDB hybrid retrieval layer (precision overlay on MemOS recall)",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable LanceDB hybrid retrieval as precision layer"
+          },
+          "dbPath": {
+            "type": "string",
+            "description": "LanceDB database directory path (default: ~/.openclaw/memory/memos-lancedb)"
+          },
+          "vectorDim": {
+            "type": "integer",
+            "default": 1024,
+            "description": "Embedding vector dimensions"
+          },
+          "embedder": {
+            "type": "object",
+            "description": "Embedding configuration",
+            "additionalProperties": false,
+            "properties": {
+              "apiKey": {
+                "type": "string",
+                "description": "API key for embedding provider"
+              },
+              "model": {
+                "type": "string",
+                "default": "text-embedding-3-small",
+                "description": "Embedding model (e.g. text-embedding-3-small, nomic-embed-text)"
+              },
+              "baseURL": {
+                "type": "string",
+                "description": "OpenAI-compatible embedding endpoint (e.g. https://api.jina.ai/v1)"
+              },
+              "dimensions": {
+                "type": "integer",
+                "description": "Override vector dimensions"
+              },
+              "taskQuery": {
+                "type": "string",
+                "description": "Task parameter for query embeddings (Jina: retrieval.query)"
+              },
+              "normalized": {
+                "type": "boolean",
+                "description": "Request normalized embeddings"
+              }
+            }
+          },
+          "vectorWeight": {
+            "type": "number",
+            "default": 0.7,
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Vector search weight in hybrid fusion"
+          },
+          "bm25Weight": {
+            "type": "number",
+            "default": 0.3,
+            "minimum": 0,
+            "maximum": 1,
+            "description": "BM25 keyword search weight in hybrid fusion"
+          },
+          "topK": {
+            "type": "integer",
+            "default": 6,
+            "minimum": 1,
+            "maximum": 20,
+            "description": "Number of LanceDB results to return"
+          },
+          "candidatePoolSize": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 10,
+            "maximum": 100,
+            "description": "Candidates fetched before fusion/reranking"
+          },
+          "hardMinScore": {
+            "type": "number",
+            "default": 0.35,
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Hard cutoff: discard results below this score after all stages"
+          },
+          "rerank": {
+            "type": "string",
+            "enum": ["cross-encoder", "lightweight", "none"],
+            "default": "cross-encoder",
+            "description": "Reranking mode after fusion"
+          },
+          "rerankApiKey": {
+            "type": "string",
+            "description": "API key for cross-encoder reranker (Jina, etc.)"
+          },
+          "rerankModel": {
+            "type": "string",
+            "default": "jina-reranker-v3",
+            "description": "Reranker model name"
+          },
+          "rerankEndpoint": {
+            "type": "string",
+            "default": "https://api.jina.ai/v1/rerank",
+            "description": "Reranker API endpoint"
+          },
+          "recencyWeight": {
+            "type": "number",
+            "default": 0.1,
+            "minimum": 0,
+            "maximum": 0.5,
+            "description": "Maximum recency boost factor for new memories"
+          },
+          "recencyHalfLifeDays": {
+            "type": "number",
+            "default": 14,
+            "description": "Half-life in days for recency boost"
+          },
+          "filterNoise": {
+            "type": "boolean",
+            "default": true,
+            "description": "Filter out noise queries (greetings, commands, etc.)"
+          }
+        }
+      }
+    },
+    "additionalProperties": false
+  }
+}
