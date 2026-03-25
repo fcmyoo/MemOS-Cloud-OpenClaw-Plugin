@@ -272,6 +272,8 @@ export class LanceDBRetriever {
       if (existing) {
         existing.score += score;
         existing.sources.vector = r.score;
+        // Prefer vector from vector-search result (more reliable)
+        if (!existing.vector && r.vector) existing.vector = r.vector;
       } else {
         scoreMap.set(r.entry.id, {
           id: r.entry.id,
@@ -281,6 +283,7 @@ export class LanceDBRetriever {
           importance: r.entry.importance,
           timestamp: r.entry.timestamp,
           metadata: r.entry.metadata,
+          vector: r.vector || null, // carry vector for downstream MMR
           score,
           sources: { vector: r.score },
         });
@@ -295,6 +298,7 @@ export class LanceDBRetriever {
       if (existing) {
         existing.score += score;
         existing.sources.bm25 = r.score;
+        if (!existing.vector && r.vector) existing.vector = r.vector;
       } else {
         scoreMap.set(r.entry.id, {
           id: r.entry.id,
@@ -304,6 +308,7 @@ export class LanceDBRetriever {
           importance: r.entry.importance,
           timestamp: r.entry.timestamp,
           metadata: r.entry.metadata,
+          vector: r.vector || null,
           score,
           sources: { bm25: r.score },
         });
@@ -376,7 +381,8 @@ export class LanceDBRetriever {
     if (!results.length || !this.config.rerankApiKey) return results;
 
     try {
-      const documents = results.map((r) => r.text);
+      // r.text is the top-level field set by _rrfFusion (not r.entry.text)
+      const documents = results.map((r) => r.text || "");
 
       const res = await fetch(`${this.config.rerankEndpoint}`, {
         method: "POST",

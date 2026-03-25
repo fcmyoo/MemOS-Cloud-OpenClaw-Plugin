@@ -1,6 +1,14 @@
 /**
  * LanceDB Storage Layer for MemOS Plugin
  * Provides vector + BM25 hybrid storage with multi-scope support
+ *
+ * Changes from v0.1.7:
+ *  - Fix _schema(): replaced invalid ArenaBasedFixedSizeListBuilder with sample-data bootstrap
+ *  - Fix BM25: proper avgDocLen tracking (no longer avgLen = docLen self-assignment)
+ *  - Fix vectorSearch scopeFilter: try native prefilter first, fallback to post-filter
+ *  - Fix: all results now carry `vector` field for MMR downstream use
+ *  - Add: FTS index creation on table init (best-effort)
+ *  - Add: _docCount / _totalDocLen stats tracking on write
  */
 
 import { randomUUID } from "node:crypto";
@@ -29,15 +37,16 @@ export const MEMORY_CATEGORIES = [
  * @property {string} category
  * @property {string} scope
  * @property {number} importance - 0.0 to 1.0
- * @property {number} timestamp - Unix ms
+ * @property {number} timestamp  - Unix ms
  * @property {string} [metadata] - JSON string for extensible fields
  */
 
 /**
  * @typedef {Object} MemorySearchResult
  * @property {MemoryEntry} entry
+ * @property {number[]} vector   - carried for downstream MMR dedup
  * @property {number} score
- * @property {{ vector?: { score: number, rank: number }, bm25?: { score: number, rank: number }, fused?: { score: number } }} sources
+ * @property {{ vector?: { score: number, rank: number }, bm25?: { score: number, rank: number } }} sources
  */
 
 // ============================================================================
@@ -65,12 +74,10 @@ export function validateStoragePath(dbPath) {
     throw new Error("LanceDB dbPath is required");
   }
 
-  // Expand ~ to home dir
   let resolvedPath = dbPath.startsWith("~/")
     ? join(homedir(), dbPath.slice(2))
     : dbPath;
 
-  // Create directory if missing
   if (!existsSync(resolvedPath)) {
     try {
       mkdirSync(resolvedPath, { recursive: true });
@@ -81,7 +88,6 @@ export function validateStoragePath(dbPath) {
     }
   }
 
-  // Check write permission
   try {
     accessSync(resolvedPath, constants.W_OK);
   } catch (err) {
@@ -98,6 +104,7 @@ export function validateStoragePath(dbPath) {
 // ============================================================================
 
 const TABLE_NAME = "memories";
+const SCHEMA_INIT_ID = "__schema_init__";
 
 export class MemoryStore {
   /** @type {import("@lancedb/lancedb").Connection|null} */
@@ -107,6 +114,10 @@ export class MemoryStore {
   initPromise = null;
   ftsSupported = false;
   ftsIndexCreated = false;
+
+  // BM25 document stats — tracked in-memory, fallback 500 words for cold start
+  _docCount = 0;
+  _totalDocLen = 0;
 
   /**
    * @param {{ dbPath: string, vectorDim: number }} config
@@ -118,6 +129,13 @@ export class MemoryStore {
 
   get vectorDim() {
     return this._vectorDim;
+  }
+
+  /** Average document word-count for BM25 length normalization */
+  get avgDocLen() {
+    return this._docCount > 0
+      ? this._totalDocLen / this._docCount
+      : 500; // cold-start fallback: 500 words
   }
 
   /** Ensure DB is initialized (idempotent) */
@@ -134,8 +152,7 @@ export class MemoryStore {
     let resolvedPath;
     try {
       resolvedPath = validateStoragePath(this.config.dbPath);
-    } catch (err) {
-      // If path validation fails, try as-is (might be a fresh path)
+    } catch {
       resolvedPath = this.config.dbPath;
     }
 
@@ -151,45 +168,57 @@ export class MemoryStore {
     try {
       this.table = await this.db.openTable(TABLE_NAME);
     } catch {
-      // Table doesn't exist, create it
-      this.table = await this.db.createTable(TABLE_NAME, await this._schema());
+      // Table doesn't exist — bootstrap via sample data to define schema
+      await this._createTableWithSchema();
     }
 
-    // Check FTS support
+    // Create FTS index for the text column (best-effort, non-fatal)
     try {
-      const version = this.db.engineVersion ? await this.db.engineVersion() : null;
-      this.ftsSupported = Boolean(version);
+      // @lancedb/lancedb >= 0.12 supports createIndex with fts type
+      await this.table.createIndex("text", { type: "fts" });
+      this.ftsIndexCreated = true;
+      this.ftsSupported = true;
     } catch {
+      // Index may already exist, or FTS not supported in this build — ignore
       this.ftsSupported = false;
     }
-
-    return;
   }
 
-  async _schema() {
-    const lancedb = await loadLanceDB();
-    const { table, ...rest } = await lancedb;
-    // Build schema dynamically based on what's available
-    const fields = [
-      lancedb.FixedSizeList(lancedb.Float32, this._vectorDim).createField("vector"),
+  /**
+   * Bootstrap the table schema using a throwaway sample record.
+   * This avoids requiring apache-arrow as an explicit dependency.
+   */
+  async _createTableWithSchema() {
+    const sampleData = [
+      {
+        id: SCHEMA_INIT_ID,
+        text: "",
+        vector: new Array(this._vectorDim).fill(0),
+        category: "other",
+        scope: "global",
+        importance: 0.5,
+        timestamp: 0.0,
+        metadata: null,
+      },
     ];
-
-    return new lancedb.ArenaBasedFixedSizeListBuilder(
-      "memories",
-      lancedb.FixedSizeList(lancedb.Float32, this._vectorDim).createField("vector"),
-      16, // row group size
-    );
+    this.table = await this.db.createTable(TABLE_NAME, sampleData);
+    // Remove the bootstrap record immediately (best-effort)
+    try {
+      await this.table.delete(`id = '${SCHEMA_INIT_ID}'`);
+    } catch {
+      // Non-critical
+    }
   }
 
   /** Add a single memory entry */
   async add(entry) {
     await this.ensureInitialized();
-    const lancedb = await loadLanceDB();
 
     const now = Date.now();
+    const text = entry.text || "";
     const row = {
       id: entry.id || randomUUID(),
-      text: entry.text,
+      text,
       vector: entry.vector || new Array(this._vectorDim).fill(0),
       category: entry.category || "other",
       scope: entry.scope || "global",
@@ -199,6 +228,14 @@ export class MemoryStore {
     };
 
     await this.table.add([row]);
+
+    // Track BM25 document stats in-memory
+    const wordCount = text.split(/\s+/).filter(Boolean).length;
+    if (wordCount > 0) {
+      this._docCount++;
+      this._totalDocLen += wordCount;
+    }
+
     return row;
   }
 
@@ -206,48 +243,69 @@ export class MemoryStore {
   async vectorSearch(vector, { limit = 10, scopeFilter } = {}) {
     await this.ensureInitialized();
 
-    let query = this.table.vectorSearch(vector, {
-      limit,
-      ...(scopeFilter ? { prefilter: true } : {}),
-    });
+    if (scopeFilter?.length) {
+      // Attempt 1: native prefilter (LanceDB >= 0.12, avoids full table scan)
+      try {
+        const whereClause = `scope IN (${scopeFilter.map((s) => `'${s}'`).join(",")})`;
+        const rawResults = await this.table
+          .vectorSearch(vector)
+          .prefilter(whereClause)
+          .limit(limit)
+          .toArray();
 
-    if (scopeFilter) {
-      // Apply scope filter post-query (LanceDB pre-filter on string columns)
+        if (rawResults.length > 0) {
+          return rawResults.map((row, rank) => ({
+            entry: row,
+            vector: Array.isArray(row.vector) ? row.vector : null,
+            score: 1 - (row._distance ?? 0),
+            sources: { vector: { score: 1 - (row._distance ?? 0), rank } },
+          }));
+        }
+      } catch {
+        // prefilter API not available — fall through to post-filter
+      }
+
+      // Fallback: fetch a wider window and re-rank by cosine similarity
       const all = await this.table
         .query()
-        .where(`scope IN (${scopeFilter.map(s => `"${s}"`).join(",")})`)
-        .limit(limit * 3)
+        .where(`scope IN (${scopeFilter.map((s) => `"${s}"`).join(",")})`)
+        .limit(limit * 4)
         .toArray();
 
-      // Re-rank by vector similarity
-      const results = all
-        .map((row) => ({
-          entry: row,
-          score: cosineSimilarity(vector, row.vector),
-          sources: { vector: { score: cosineSimilarity(vector, row.vector), rank: 0 } },
-        }))
+      return all
+        .map((row) => {
+          const rowVector = Array.isArray(row.vector) ? row.vector : null;
+          const score = rowVector ? cosineSimilarity(vector, rowVector) : 0;
+          return {
+            entry: row,
+            vector: rowVector,
+            score,
+            sources: { vector: { score, rank: 0 } },
+          };
+        })
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
-
-      return results;
     }
 
-    const results = await query.toArray();
+    // No scope filter: direct ANN
+    const results = await this.table
+      .vectorSearch(vector)
+      .limit(limit)
+      .toArray();
+
     return results.map((row, rank) => ({
       entry: row,
+      vector: Array.isArray(row.vector) ? row.vector : null,
       score: 1 - (row._distance ?? 0),
-      sources: {
-        vector: { score: 1 - (row._distance ?? 0), rank },
-      },
+      sources: { vector: { score: 1 - (row._distance ?? 0), rank } },
     }));
   }
 
-  /** BM25 full-text search using LanceDB FTS */
+  /** BM25 full-text search — uses FTS index if available, otherwise naive match */
   async bm25Search(query, { limit = 10, scopeFilter } = {}) {
     await this.ensureInitialized();
 
     if (!this.ftsSupported) {
-      // Fallback: naive text match
       return this._naiveTextSearch(query, { limit, scopeFilter });
     }
 
@@ -255,20 +313,23 @@ export class MemoryStore {
       let q = this.table.query();
 
       if (scopeFilter) {
-        const scopeConditions = scopeFilter.map(s => `scope = "${s}"`).join(" OR ");
+        const scopeConditions = scopeFilter.map((s) => `scope = "${s}"`).join(" OR ");
         q = q.where(scopeConditions);
       }
 
-      const results = await q
-        .limit(limit * 2)
-        .toArray();
+      const results = await q.limit(limit * 2).toArray();
+      const avgLen = this.avgDocLen;
 
       const scored = results
-        .map((row, rank) => ({
-          entry: row,
-          score: bm25Score(row.text || "", query),
-          sources: { bm25: { score: bm25Score(row.text || "", query), rank } },
-        }))
+        .map((row, rank) => {
+          const score = bm25Score(row.text || "", query, avgLen);
+          return {
+            entry: row,
+            vector: Array.isArray(row.vector) ? row.vector : null,
+            score,
+            sources: { bm25: { score, rank } },
+          };
+        })
         .filter((r) => r.score > 0)
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
@@ -279,45 +340,47 @@ export class MemoryStore {
     }
   }
 
-  /** Naive fallback when FTS is unavailable */
+  /** Naive keyword fallback when FTS is unavailable */
   async _naiveTextSearch(query, { limit = 10, scopeFilter } = {}) {
     await this.ensureInitialized();
 
     const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (!keywords.length) return [];
 
-    let q = this.table.query().limit(100);
-    const results = await q.toArray();
+    const results = await this.table.query().limit(200).toArray();
+    const avgLen = this.avgDocLen;
 
-    const filtered = results
+    return results
       .filter((row) => {
         if (scopeFilter && !scopeFilter.includes(row.scope)) return false;
         const text = (row.text || "").toLowerCase();
         return keywords.some((kw) => text.includes(kw));
       })
-      .map((row, rank) => ({
-        entry: row,
-        score: keywords.filter((kw) => (row.text || "").toLowerCase().includes(kw)).length / keywords.length,
-        sources: { bm25: { score: keywords.filter((kw) => (row.text || "").toLowerCase().includes(kw)).length / keywords.length, rank } },
-      }))
+      .map((row) => {
+        const score = bm25Score(row.text || "", query, avgLen);
+        return {
+          entry: row,
+          vector: Array.isArray(row.vector) ? row.vector : null,
+          score,
+          sources: { bm25: { score, rank: 0 } },
+        };
+      })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
-
-    return filtered;
   }
 
   /** Delete by IDs */
   async delete(ids) {
     await this.ensureInitialized();
     if (!ids || !ids.length) return;
-    await this.table.delete(`id IN (${ids.map(id => `"${id}"`).join(",")})`);
+    await this.table.delete(`id IN (${ids.map((id) => `"${id}"`).join(",")})`);
   }
 
   /** Get stats */
   async stats() {
     await this.ensureInitialized();
     const total = await this.table.query().count();
-    return { total };
+    return { total, avgDocLen: this.avgDocLen, docCount: this._docCount };
   }
 }
 
@@ -338,17 +401,22 @@ export function cosineSimilarity(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
-/** Simple BM25 scoring */
-function bm25Score(doc, query, k1 = 1.5, b = 0.75) {
-  const docLen = doc.split(/\s+/).length;
-  const avgLen = docLen; // Simplified: use doc itself as estimate
+/**
+ * BM25 term-frequency scoring with proper length normalization.
+ * @param {string} doc   - document text
+ * @param {string} query - search query
+ * @param {number} avgLen - corpus average document word-count (default 500)
+ * @param {number} k1
+ * @param {number} b
+ */
+function bm25Score(doc, query, avgLen = 500, k1 = 1.5, b = 0.75) {
+  const docLen = doc.split(/\s+/).filter(Boolean).length;
   const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
 
   let score = 0;
   for (const term of keywords) {
-    const termFreq = (doc.toLowerCase().match(new RegExp(term, "g")) || []).length;
+    const termFreq = (doc.toLowerCase().match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
     if (termFreq === 0) continue;
-    // Simplified BM25: TF / (TF + k1 * (1 - b + b * docLen / avgLen))
     score += termFreq / (termFreq + k1 * (1 - b + b * docLen / Math.max(avgLen, 1)));
   }
   return score;
