@@ -154,6 +154,99 @@
         "type": "integer",
         "default": 0
       },
+      "allowedAgentIds": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Allowlist of agentId values permitted for memory recall and write. Empty = all blocked."
+      },
+      "dynamicUserIdFormat": {
+        "type": "string",
+        "enum": ["agent", "agent:user"],
+        "default": "agent",
+        "description": "user_id format passed to MemOS: 'agent' → openclaw_{agentId}, 'agent:user' → openclaw_{agentId}:user"
+      },
+      "dynamicConversationPrefixMode": {
+        "type": "string",
+        "enum": ["agent", "inherit"],
+        "default": "agent",
+        "description": "conversation_id prefix strategy: 'agent' = {agentId}:, 'inherit' = cfg.conversationIdPrefix"
+      },
+      "dynamicTagMode": {
+        "type": "string",
+        "enum": ["agent-only", "agent-and-memos", "inherit"],
+        "default": "agent-and-memos",
+        "description": "custom_tags strategy for memory writes"
+      },
+      "memoryEnabled": {
+        "type": "boolean",
+        "default": true,
+        "description": "Master switch for memory (recall + write)"
+      },
+      "memoryScopeMode": {
+        "type": "string",
+        "enum": ["user", "chat", "hybrid"],
+        "default": "hybrid",
+        "description": "Scope key strategy: user / chat / hybrid (chat+user)"
+      },
+      "memoryTopK": {
+        "type": "integer",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 50,
+        "description": "Alias for memoryLimitNumber; max memories returned from MemOS"
+      },
+      "memoryCacheTtlSec": {
+        "type": "integer",
+        "default": 60,
+        "minimum": 0,
+        "maximum": 3600,
+        "description": "TTL for recall result cache (seconds)"
+      },
+      "memoryDegradeOnError": {
+        "type": "boolean",
+        "default": true,
+        "description": "If true, swallow errors silently; if false, throw on recall/write failure"
+      },
+      "memoryGrayPercent": {
+        "type": "integer",
+        "default": 100,
+        "minimum": 0,
+        "maximum": 100,
+        "description": "Gray rollout percentage (0–100) for memory activation"
+      },
+      "memosSearchFallbackEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Allow MemOS cloud fallback when LanceDB results are weak"
+      },
+      "memosSearchFallbackMode": {
+        "type": "string",
+        "enum": ["empty-only", "weak-or-empty"],
+        "default": "empty-only",
+        "description": "When to fall back to MemOS: empty-only = only when LanceDB returns nothing; weak-or-empty = also when top score is low"
+      },
+      "memosSearchFallbackMinScore": {
+        "type": "number",
+        "default": 0.45,
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Min LanceDB score threshold before triggering MemOS fallback (weak-or-empty mode)"
+      },
+      "tenantId": {
+        "type": "string",
+        "default": "default",
+        "description": "Tenant namespace for scoping memories"
+      },
+      "channel": {
+        "type": "string",
+        "default": "openclaw",
+        "description": "Channel identifier written into memory scope key"
+      },
+      "platform": {
+        "type": "string",
+        "default": "openclaw",
+        "description": "Platform identifier written into memory metadata (openclaw/claude/gemini/codex/cursor/antigravity)"
+      },
       "lancedb": {
         "type": "object",
         "description": "LanceDB hybrid retrieval layer (precision overlay on MemOS recall)",
