@@ -12,7 +12,6 @@ import {
   addMessage,
   buildConfig,
   extractText,
-  formatPromptBlock,
   USER_QUERY_MARKER,
   searchMemory,
 } from "./lib/memos-cloud-api.js";
@@ -21,6 +20,53 @@ import {
 import { createEmbedder } from "./lib/lancedb-embedder.js";
 import { createRetriever } from "./lib/lancedb-retriever.js";
 import { mergeAndFormat, formatLanceDBOnly } from "./lib/lancedb-fusion.js";
+import { getMemosFallbackDecision } from "./lib/memos-fallback.js";
+import { normalizeMemosSearchResult } from "./lib/memos-result-normalizer.js";
+import { buildUnifiedRecallResults, summarizeUnifiedRecall } from "./lib/unified-recall.js";
+
+function buildRecallTrace({
+  lancedbResults = [],
+  lancedbTrace = null,
+  fallbackDecision = null,
+  memosNormalized = null,
+  unifiedResults = [],
+} = {}) {
+  const lancedbTopScore = Number(lancedbResults[0]?.score ?? fallbackDecision?.topScore ?? 0);
+  const fallbackReason = fallbackDecision?.reason || "not_needed";
+  const memosSummary = memosNormalized?.summary || {
+    textMem: 0,
+    prefMem: 0,
+    toolMem: 0,
+    skillMem: 0,
+    actMem: 0,
+    paraMem: 0,
+  };
+  const unifiedPreview = summarizeUnifiedRecall(
+    unifiedResults.length > 0 ? unifiedResults : buildUnifiedRecallResults(lancedbResults, memosNormalized),
+    5,
+  );
+
+  return {
+    lancedb: {
+      count: lancedbResults.length,
+      top_score: lancedbTopScore,
+      trace: lancedbTrace,
+    },
+    fallback: {
+      enabled: Boolean(fallbackDecision),
+      reason: fallbackReason,
+      lancedb_top_score: lancedbTopScore,
+      should_fallback: Boolean(fallbackDecision?.shouldFallback),
+    },
+    memos: {
+      summary: memosSummary,
+    },
+    unified: {
+      count: unifiedResults.length > 0 ? unifiedResults.length : lancedbResults.length,
+      preview: unifiedPreview,
+    },
+  };
+}
 
 // ── State ────────────────────────────────────────────────────────────────────
 let lastCaptureTime = 0;
@@ -75,7 +121,7 @@ function initLanceDB(cfg) {
   }
 
   try {
-    const embedder = createEmbedder({
+    const embedder = TEST_SEAMS.createEmbedder({
       apiKey: lancedbConfig.embedder?.apiKey
         || process.env.LANCEDB_EMBED_API_KEY
         || process.env.OPENAI_API_KEY,
@@ -88,7 +134,7 @@ function initLanceDB(cfg) {
       normalized: lancedbConfig.embedder?.normalized ?? true,
     });
 
-    lancedbRetriever = createRetriever(
+    lancedbRetriever = TEST_SEAMS.createRetriever(
       {
         ...lancedbConfig,
         rerankApiKey: lancedbConfig.rerankApiKey
@@ -129,6 +175,58 @@ function stripPrependedPrompt(content) {
   return content.slice(idx + USER_QUERY_MARKER.length).trimStart();
 }
 
+function cleanupRecallPrompt(prompt) {
+  if (!prompt) return "";
+
+  let text = String(prompt);
+  const jsonBlockMatch = text.match(/```json[\s\S]*?```/gi);
+  if (jsonBlockMatch?.length) {
+    for (const block of jsonBlockMatch) {
+      text = text.replace(block, " ");
+    }
+  }
+
+  text = text
+    .replace(/^[ \t]*Conversation info[\s\S]*?(?=\n\s*\n|\n[A-Z][^\n]{0,80}:|$)/gim, " ")
+    .replace(/^[ \t]*Sender[\s\S]*?(?=\n\s*\n|\n[A-Z][^\n]{0,80}:|$)/gim, " ");
+
+  text = stripPrependedPrompt(text)
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/^\s*\{[^}]{5,200}\}\s*$/gm, " ")
+    .replace(/^\s*\[[^\]]{5,200}\]\s*$/gm, " ")
+    .replace(/<precision-memories>[\s\S]*?<\/precision-memories>/gi, " ")
+    .replace(/<system[\s\S]*?>/gi, " ")
+    .replace(/\bConversation info\b[\s\S]{0,200}/g, " ")
+    .replace(/\bSender\b[\s\S]{0,200}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return stripPrependedPrompt(text)
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function resolveRecallQuery(event, ctx) {
+  if (event?.messages?.length) {
+    const messages = event.messages;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (message?.role !== "user" || !message?.content) continue;
+
+      const rawText = typeof message.content === "string"
+        ? message.content
+        : message.content?.text || extractText(message.content) || "";
+      const text = stripPrependedPrompt(rawText).trim();
+      if (text.length >= 5) return text;
+    }
+  }
+
+  const prompt = cleanupRecallPrompt(event?.prompt || "");
+  if (prompt) return prompt;
+
+  return stripPrependedPrompt(event?.prompt || "").trim();
+}
+
 function getCounterSuffix(sessionKey) {
   if (!sessionKey) return "";
   const current = conversationCounters.get(sessionKey) ?? 0;
@@ -141,11 +239,54 @@ function bumpConversationCounter(sessionKey) {
   conversationCounters.set(sessionKey, current + 1);
 }
 
+function resolveRuntimeAgentId(cfg, ctx) {
+  if (ctx?.agentId) return String(ctx.agentId).trim();
+  if (ctx?.sessionKey) return String(ctx.sessionKey).trim();
+  if (cfg.agentId) return String(cfg.agentId).trim();
+  return "default";
+}
+
+function buildRuntimeUserId(cfg, runtimeAgentId) {
+  if (cfg.dynamicUserIdFormat === "agent:user") return `openclaw_${runtimeAgentId}:user`;
+  return `openclaw_${runtimeAgentId}`;
+}
+
+function buildRuntimeConversationPrefix(cfg, runtimeAgentId) {
+  if (cfg.dynamicConversationPrefixMode === "inherit") return cfg.conversationIdPrefix || "";
+  return `${runtimeAgentId}:`;
+}
+
+function buildRuntimeTags(cfg, runtimeAgentId) {
+  if (cfg.dynamicTagMode === "inherit") return Array.isArray(cfg.tags) ? cfg.tags : [];
+  if (cfg.dynamicTagMode === "agent-only") return [runtimeAgentId];
+  return [runtimeAgentId, "memos"];
+}
+
+/**
+ * Infer a memory category from content keywords.
+ * Used when writing to LanceDB so entries aren't all "other".
+ */
+function inferCategory(text) {
+  if (!text) return "other";
+  if (/(喜欢|偏好|不要|总是|习惯|prefer|always|never|like|dislike)/i.test(text)) return "preference";
+  if (/(决定|结论|方案|选择|TODO|待办|决策|decided|conclusion|plan)/i.test(text)) return "decision";
+  if (/(我是|我叫|我的名字|工作|公司|住在|I am|my name|I work)/i.test(text)) return "entity";
+  if (/(记得|回忆|之前|上次|remember|recall|last time|previously)/i.test(text)) return "reflection";
+  return "fact";
+}
+
+function isAgentAllowed(cfg, ctx) {
+  if (!Array.isArray(cfg.allowedAgentIds) || cfg.allowedAgentIds.length === 0) return false;
+  const runtimeAgentId = resolveRuntimeAgentId(cfg, ctx);
+  return cfg.allowedAgentIds.includes(runtimeAgentId);
+}
+
 function resolveConversationId(cfg, ctx) {
   if (cfg.conversationId) return cfg.conversationId;
-  const base = ctx?.sessionKey || ctx?.sessionId || (ctx?.agentId ? `openclaw:${ctx.agentId}` : "");
+  const runtimeAgentId = resolveRuntimeAgentId(cfg, ctx);
+  const base = ctx?.sessionKey || ctx?.sessionId || `openclaw:${runtimeAgentId}`;
   const dynamicSuffix = cfg.conversationSuffixMode === "counter" ? getCounterSuffix(ctx?.sessionKey) : "";
-  const prefix = cfg.conversationIdPrefix || "";
+  const prefix = buildRuntimeConversationPrefix(cfg, runtimeAgentId);
   const suffix = cfg.conversationIdSuffix || "";
   if (base) return `${prefix}${base}${dynamicSuffix}${suffix}`;
   return `${prefix}openclaw-${Date.now()}${dynamicSuffix}${suffix}`;
@@ -163,7 +304,8 @@ function logEvent(log, level, event, fields = {}) {
 }
 
 function buildIdentity(cfg, ctx) {
-  const userId = cfg.userId || "openclaw-user";
+  const runtimeAgentId = resolveRuntimeAgentId(cfg, ctx);
+  const userId = buildRuntimeUserId(cfg, runtimeAgentId);
   const chatId = ctx?.sessionKey || ctx?.sessionId || "default-chat";
   const threadId = ctx?.threadId || "";
   return {
@@ -172,6 +314,7 @@ function buildIdentity(cfg, ctx) {
     chatId,
     userId,
     threadId,
+    agentId: runtimeAgentId,
   };
 }
 
@@ -224,6 +367,45 @@ function writeRecallCache(key, value, ttlSec) {
   });
 }
 
+function normalizeQuery(query) {
+  const cleaned = cleanupRecallPrompt(query);
+  if (!cleaned || cleaned.length < 2) return "";
+
+  return String(cleaned)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .slice(0, 200);
+}
+
+function buildRecallCacheKey(cfg, scopeKey, recallQuery, lancedbEnabled) {
+  const sourceTag = lancedbEnabled
+    ? (cfg.memosSearchFallbackEnabled ? "lm" : "l")
+    : "m";
+  const fallbackMode = cfg.memosSearchFallbackMode || "empty-only";
+  return `${scopeKey}|${normalizeQuery(recallQuery)}|${sourceTag}|${fallbackMode}`;
+}
+
+function shouldWriteMessage(msg, cfg) {
+  if (!msg?.content) return false;
+  const text = String(msg.content).trim();
+  if (!text) return false;
+
+  const assistantMinChars = 20;
+  const userMinChars = 3;
+  const minChars = msg.role === "assistant" ? assistantMinChars : userMinChars;
+  if (text.length < minChars) return false;
+
+  const fillerRe = /^(ok|okay|好的?|收到|明白|了解|嗯+|哦+|啊+|哈+|谢谢|thanks?|ty|yes|yep|yeah|sure|nice|cool|wow|perfect|great|我来看看|稍等|稍等一下|稍等哈)$/i;
+  if (fillerRe.test(text)) return false;
+
+  const strongKeepRe = /(记住|偏好|喜欢|不要|总是|以后|我的名字|我是|我叫|结论|决定|TODO|待办|风险|原因|修复|方案)/i;
+  if (strongKeepRe.test(text)) return true;
+
+  if (msg.role === "assistant" && text.length < 30) return false;
+  return true;
+}
+
 function buildSearchPayload(cfg, prompt, ctx) {
   const queryRaw = `${cfg.queryPrefix || ""}${prompt}`;
   const query =
@@ -231,9 +413,10 @@ function buildSearchPayload(cfg, prompt, ctx) {
       ? queryRaw.slice(0, cfg.maxQueryChars)
       : queryRaw;
   const scopeKey = resolveScopeKey(cfg, ctx);
+  const identity = buildIdentity(cfg, ctx);
 
   const payload = {
-    user_id: cfg.userId,
+    user_id: identity.userId,
     query,
     source: MEMOS_SOURCE,
     session_id: resolveSessionId(cfg, ctx),
@@ -253,22 +436,36 @@ function buildSearchPayload(cfg, prompt, ctx) {
   return payload;
 }
 
+function extractUserMessages(messages) {
+  if (!messages || !Array.isArray(messages)) return "";
+  return messages
+    .filter((message) => message?.role === "user")
+    .map((message) => {
+      const content = message.content;
+      return typeof content === "string" ? content : content?.text || "";
+    })
+    .filter((text) => text.trim().length > 0)
+    .join(" ");
+}
+
 function buildAddMessagePayload(cfg, messages, ctx) {
   const asyncMode = cfg.memoryWriteAsync ? "async" : "sync";
   const identity = buildIdentity(cfg, ctx);
+  const runtimeTags = buildRuntimeTags(cfg, identity.agentId);
   const payload = {
-    user_id: cfg.userId,
+    user_id: identity.userId,
     session_id: resolveSessionId(cfg, ctx),
     messages,
     source: MEMOS_SOURCE,
     async_mode: asyncMode,
   };
 
-  if (cfg.tags?.length) payload.custom_tags = cfg.tags;
+  if (runtimeTags.length) payload.custom_tags = runtimeTags;
   if (cfg.allowKnowledgebaseIds?.length) payload.writable_cube_ids = cfg.allowKnowledgebaseIds;
 
   const info = {
-    source: "openclaw",
+    source: cfg.platform || "openclaw",
+    platform: cfg.platform || "openclaw",
     sessionKey: ctx?.sessionKey,
     agentId: ctx?.agentId,
     tenant_id: identity.tenantId,
@@ -280,7 +477,7 @@ function buildAddMessagePayload(cfg, messages, ctx) {
     scope_key: resolveScopeKey(cfg, ctx),
     ...(cfg.info || {}),
   };
-  if (cfg.agentId) info.agent_id = cfg.agentId;
+  info.agent_id = identity.agentId;
   if (cfg.appId) info.app_id = cfg.appId;
   if (Object.keys(info).length > 0) payload.info = info;
 
@@ -337,6 +534,26 @@ function truncate(text, maxLen) {
   return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
 }
 
+// ── Test Seams ───────────────────────────────────────────────────────────────
+
+const TEST_SEAMS = {
+  createEmbedder,
+  createRetriever,
+  searchMemory,
+};
+
+export function __setTestSeamsForTests(overrides = {}) {
+  Object.assign(TEST_SEAMS, overrides);
+}
+
+export function __resetTestSeamsForTests() {
+  TEST_SEAMS.createEmbedder = createEmbedder;
+  TEST_SEAMS.createRetriever = createRetriever;
+  TEST_SEAMS.searchMemory = searchMemory;
+  lancedbRetriever = null;
+  lancedbInitialized = false;
+}
+
 // ── Main Plugin ───────────────────────────────────────────────────────────────
 
 export default {
@@ -382,7 +599,14 @@ export default {
 
     // ── before_agent_start: LanceDB → MemOS merged recall ─────────────────
     api.on("before_agent_start", async (event, ctx) => {
+      log.info?.(`[memos-cloud] before_agent_start fired for channel: ${ctx?.channel || cfg.channel || "unknown"}, agentId: ${ctx?.agentId || "?"}`);
       if (!cfg.recallEnabled) return;
+      if (!isAgentAllowed(cfg, ctx)) {
+        logEvent(log, "info", "recall.agent_skip", {
+          agent_id: resolveRuntimeAgentId(cfg, ctx),
+        });
+        return;
+      }
       if (!isMemoryEnabledForContext(cfg, ctx)) {
         logEvent(log, "info", "recall.gray_skip", {
           scope_key: resolveScopeKey(cfg, ctx),
@@ -397,6 +621,25 @@ export default {
 
       try {
         const prompt = event.prompt;
+        const recallQuery = resolveRecallQuery(event, ctx) || prompt;
+        const scopeKey = resolveScopeKey(cfg, ctx);
+        const recallCacheKey = buildRecallCacheKey(cfg, scopeKey, recallQuery, lancedbEnabled);
+        const cachedResult = readRecallCache(recallCacheKey);
+
+        if (cachedResult?.prependContext) {
+          logEvent(log, "info", "recall.cache_hit", {
+            trace_id: traceId,
+            cost_ms: Date.now() - startedAt,
+            total_chars: cachedResult.total_chars ?? 0,
+            cache_key: recallCacheKey,
+          });
+          return {
+            prependContext: cachedResult.prependContext,
+            total_chars: cachedResult.total_chars ?? 0,
+            unifiedResults: cachedResult.unifiedResults ?? [],
+            trace: cachedResult.trace ?? {},
+          };
+        }
 
         // ── Step 1: LanceDB hybrid recall (precision layer) ─────────────
         let lancedbResults = [];
@@ -405,7 +648,7 @@ export default {
         if (lancedbEnabled && lancedbRetriever) {
           try {
             const lancedbStart = Date.now();
-            const ldbOutput = await lancedbRetriever.retrieve(prompt, {
+            const ldbOutput = await lancedbRetriever.retrieve(recallQuery, {
               scopeFilter: [resolveScopeKey(cfg, ctx), "global"],
             });
             lancedbResults = ldbOutput.results || [];
@@ -421,51 +664,88 @@ export default {
           }
         }
 
-        // ── Step 2: MemOS native recall ─────────────────────────────────
+        // ── Step 2: MemOS native recall / fallback ─────────────────────
         let memosData = null;
         let memosSuccess = false;
+        let memosNormalized = null;
+        let unifiedResults = buildUnifiedRecallResults(lancedbResults, null);
+        const fallbackDecision = getMemosFallbackDecision(cfg, lancedbResults);
+        logEvent(log, "info", "memos.fallback_decision", {
+          trace_id: traceId,
+          should_fallback: fallbackDecision.shouldFallback,
+          reason: fallbackDecision.reason,
+          lancedb_top_score: fallbackDecision.topScore,
+          memos_called: fallbackDecision.memos_called,
+        });
+        const shouldRecallMemos = cfg.apiKey && (
+          !lancedbEnabled
+          || !lancedbRetriever
+          || fallbackDecision.shouldFallback
+        );
 
-        if (cfg.apiKey) {
+        if (shouldRecallMemos) {
           try {
-            const payload = buildSearchPayload(cfg, prompt, ctx);
-            const memosResult = await searchMemory(
+            const payload = buildSearchPayload(cfg, recallQuery, ctx);
+            const memosResult = await TEST_SEAMS.searchMemory(
               { ...cfg, timeoutMs: cfg.memorySearchTimeoutMs, retries: 0 },
               payload,
             );
             memosData = memosResult;
+            memosNormalized = normalizeMemosSearchResult(memosResult);
+            unifiedResults = buildUnifiedRecallResults(lancedbResults, memosNormalized);
             memosSuccess = true;
 
             logEvent(log, "info", "memos.recall", {
               trace_id: traceId,
               elapsed_ms: Date.now() - startedAt,
               lancedb_count: lancedbResults.length,
+              fallback_mode: cfg.memosSearchFallbackMode,
+              fallback_enabled: cfg.memosSearchFallbackEnabled,
+              recall: buildRecallTrace({
+                lancedbResults,
+                lancedbTrace,
+                fallbackDecision,
+                memosNormalized,
+                unifiedResults,
+              }),
             });
           } catch (err) {
             log.warn?.(`[memos-cloud] MemOS recall error: ${err.message}`);
           }
-        } else {
+        } else if (!cfg.apiKey && (!lancedbEnabled || !lancedbRetriever)) {
           warnMissingApiKey(log, "recall");
         }
+
+        const recallTrace = buildRecallTrace({
+          lancedbResults,
+          lancedbTrace,
+          fallbackDecision,
+          memosNormalized,
+          unifiedResults,
+        });
 
         // ── Step 3: Merge and inject ────────────────────────────────────
         let prependContext = "";
 
         if (lancedbResults.length > 0 && memosData) {
-          // Both available → merge
-          prependContext = mergeAndFormat(lancedbResults, memosData?.data, {
+          // Both available → single final recall output
+          prependContext = mergeAndFormat(lancedbResults, memosData?.data?.data || memosData?.data, {
             topK: cfg.memoryTopK,
             lancedbPriority: 3,
+            normalizedMemos: memosNormalized,
+            unifiedResults,
           });
         } else if (lancedbResults.length > 0) {
-          // LanceDB only → format as precision block
+          // LanceDB only → still emit final <recall>
           prependContext = formatLanceDBOnly(lancedbResults, { topK: 4 });
         } else if (memosSuccess && memosData) {
-          // MemOS only → use native formatter
-          prependContext = formatPromptBlock(memosData, {
-            wrapTagBlocks: true,
-            relativity: cfg.relativity,
-            maxOutputChars: cfg.memoryBudgetTokens * 4,
-          }) || "";
+          // MemOS only → normalize into the same final <recall> path
+          prependContext = mergeAndFormat([], memosData?.data?.data || memosData?.data, {
+            topK: cfg.memoryTopK,
+            lancedbPriority: 3,
+            normalizedMemos: memosNormalized,
+            unifiedResults,
+          });
         }
 
         if (!prependContext) return;
@@ -475,10 +755,30 @@ export default {
           cost_ms: Date.now() - startedAt,
           lancedb_count: lancedbResults.length,
           memos_success: memosSuccess,
+          recall: recallTrace,
           total_chars: prependContext.length,
+          query_len: recallQuery.length,
+          cache_key: recallCacheKey,
+          cache_ttl_sec: cfg.memoryCacheTtlSec || 300,
         });
 
-        return { prependContext };
+        writeRecallCache(
+          recallCacheKey,
+          {
+            prependContext,
+            total_chars: prependContext.length,
+            unifiedResults,
+            trace: recallTrace,
+          },
+          cfg.memoryCacheTtlSec,  // use configured TTL, no hardcoded fallback
+        );
+
+        return {
+          prependContext,
+          total_chars: prependContext.length,
+          unifiedResults,
+          trace: recallTrace,
+        };
       } catch (err) {
         logEvent(log, "warn", "recall.failed", {
           trace_id: traceId,
@@ -490,9 +790,20 @@ export default {
       }
     });
 
-    // ── agent_end: write to MemOS (unchanged) ──────────────────────────────
+    // ── agent_end: fallback recall + write to MemOS ────────────────────────
     api.on("agent_end", async (event, ctx) => {
+      log.info?.(`[memos-cloud] agent_end fired for channel: ${ctx?.channel || cfg.channel || "unknown"}`);
+
       if (!cfg.addEnabled) return;
+      if (!isAgentAllowed(cfg, ctx)) {
+        const runtimeAgentId = resolveRuntimeAgentId(cfg, ctx);
+        const hasAllowlist = Array.isArray(cfg.allowedAgentIds) && cfg.allowedAgentIds.length > 0;
+        logEvent(log, "info", hasAllowlist ? "add.agent_skip_not_allowed" : "add.agent_skip_missing_allowlist", {
+          agent_id: runtimeAgentId,
+          allowed_agent_ids: hasAllowlist ? cfg.allowedAgentIds : [],
+        });
+        return;
+      }
       if (!isMemoryEnabledForContext(cfg, ctx)) return;
       if (!event?.success || !event?.messages?.length) return;
       if (!cfg.apiKey) {
@@ -503,31 +814,86 @@ export default {
       const startedAt = Date.now();
 
       const now = Date.now();
-      if (cfg.throttleMs && now - lastCaptureTime < cfg.throttleMs) {
+      // Fix: throttleMs=0 means no throttle; only apply when explicitly > 0
+      const effectiveThrottleMs = cfg.throttleMs != null && cfg.throttleMs >= 0
+        ? cfg.throttleMs
+        : 5000;
+      if (effectiveThrottleMs > 0 && now - lastCaptureTime < effectiveThrottleMs) {
+        logEvent(log, "info", "add.throttle_skip", {
+          trace_id: traceId,
+          throttle_ms: effectiveThrottleMs,
+        });
         return;
       }
       lastCaptureTime = now;
 
       try {
-        const messages =
+        const rawMessages =
           cfg.captureStrategy === "full_session"
             ? pickFullSessionMessages(event.messages, cfg)
             : pickLastTurnMessages(event.messages, cfg);
 
-        if (!messages.length) return;
+        const messages = rawMessages.filter((msg) => shouldWriteMessage(msg, cfg));
+        if (!messages.length) {
+          logEvent(log, "info", "add.quality_skip", {
+            trace_id: traceId,
+            original_count: rawMessages.length,
+            filtered_count: rawMessages.length,
+          });
+          return;
+        }
 
         const payload = buildAddMessagePayload(cfg, messages, ctx);
-        await addMessage(
+        const addResult = await addMessage(
           { ...cfg, retries: cfg.memoryWriteRetry },
           payload,
         );
+        const scopeKey = resolveScopeKey(cfg, ctx);
         logEvent(log, "info", "add.success", {
           trace_id: traceId,
           cost_ms: Date.now() - startedAt,
-          scope_key: payload.session_id,
+          scope_key: scopeKey,
           async_mode: payload.async_mode,
           message_count: messages.length,
+          filtered_count: rawMessages.length - messages.length,
         });
+
+        // Write to LanceDB concurrently with MemOS (non-blocking, best-effort)
+        if (lancedbEnabled && lancedbRetriever?.store && lancedbRetriever?._embedder) {
+          log.info?.(`[memos-cloud] LanceDB write check: payload_messages_count=${Array.isArray(payload.messages) ? payload.messages.length : "not_array"}`);
+          const lancedbText = (
+            extractUserMessages(payload.messages)
+            || extractText(addResult?.data?.message || addResult?.message || payload.messages)
+          )?.trim();
+
+          if (lancedbText) {
+            log.info?.(`[memos-cloud] LanceDB write enqueue: text_length=${lancedbText.length}`);
+            void (async () => {
+              try {
+                const category = inferCategory(lancedbText);
+                const vector = await lancedbRetriever._embedder.embed(lancedbText);
+                await lancedbRetriever.store.add({
+                  text: lancedbText,
+                  vector,
+                  timestamp: Date.now(),
+                  scope: scopeKey,
+                  category,              // now populated via inferCategory()
+                  importance: 0.5,       // default; future: drive from MemOS score
+                  metadata: JSON.stringify({
+                    source: cfg.platform || "openclaw",
+                    platform: cfg.platform || "openclaw",
+                    session_id: payload.session_id,
+                    agent_id: resolveRuntimeAgentId(cfg, ctx),
+                  }),
+                });
+                log.info?.(`[memos-cloud] LanceDB write success: text_length=${lancedbText.length}, scope_key=${scopeKey}, category=${category}`);
+              } catch (err) {
+                log.warn?.(`[memos-cloud] LanceDB write failed: scope_key=${scopeKey}, error=${err.message}`);
+              }
+            })();
+            log.info?.("[memos-cloud] agent_end add completed; LanceDB write enqueued");
+          }
+        }
       } catch (err) {
         logEvent(log, "warn", "add.failed", {
           trace_id: traceId,
