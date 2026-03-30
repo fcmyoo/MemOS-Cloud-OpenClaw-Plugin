@@ -4,17 +4,15 @@
  * into a unified prompt context block.
  */
 
-import { USER_QUERY_MARKER } from "./memos-cloud-api.js";
-
 // ============================================================================
-// Fusion: Merge two result sets, deduplicate by text similarity
+// Fusion: Merge result sets, deduplicate by normalized text
 // ============================================================================
 
 /**
  * Merge LanceDB results (precision-first) with MemOS results (knowledge-base).
  *
- * LanceDB results are prepended with high-priority markers to ensure they're
- * seen first by the LLM. MemOS results fill remaining slots.
+ * Final output is constrained to a single <recall> block; no legacy
+ * precision/unified/memories blocks or parallel tool/skill side blocks.
  *
  * @param {Array} lancedbResults - LanceDBResult[] from LanceDBRetriever
  * @param {object} memosData - raw MemOS API response data
@@ -22,76 +20,59 @@ import { USER_QUERY_MARKER } from "./memos-cloud-api.js";
  * @returns {string} - formatted prompt block
  */
 export function mergeAndFormat(lancedbResults, memosData, options = {}) {
-  const { topK = 6, lancedbPriority = 4 } = options;
+  const { topK = 6, lancedbPriority = 4, normalizedMemos = null, unifiedResults = null } = options;
 
   const lines = [];
+  const textMem = normalizedMemos?.textMem || [];
+  const prefMem = normalizedMemos?.prefMem || [];
+  const toolMem = normalizedMemos?.toolMem || [];
+  const skillMem = normalizedMemos?.skillMem || [];
+  const unified = Array.isArray(unifiedResults) ? unifiedResults : [];
 
-  // ── Section 1: LanceDB Precision Memories ────────────────────────────────
-  if (lancedbResults && lancedbResults.length > 0) {
-    lines.push("<lancedb-precision>");
-    lines.push("  <precision-facts>");
+  // NOTE: <lancedb-precision> and <unified-recall> removed — content already
+  // covered by the single <recall> block below (collectPrimaryRecallItems).
+  // This avoids duplicate blocks in the prompt context.
 
-    const filtered = lancedbResults.slice(0, lancedbPriority);
-    for (const r of filtered) {
-      const time = formatTime(r.timestamp);
-      const cat = r.category || "fact";
-      const prefix = time ? `-[${time}]` : "";
-      const text = sanitizeText(r.text || "", 300);
-      lines.push(`     ${prefix}[${cat}] ${text}`);
-    }
+  const recallItems = collectPrimaryRecallItems({
+    lancedbResults,
+    memosData,
+    unifiedResults: unified,
+    textMem,
+    prefMem,
+    topK,
+  });
 
-    lines.push("  </precision-facts>");
-    lines.push("</lancedb-precision>");
-    lines.push("");
+  const mergedToolMem = dedupeTextEntries(
+    toolMem.length > 0
+      ? toolMem.map((item) => item.text)
+      : (memosData?.tool_memory_detail_list || []).map((item) => item.tool_value || "").filter(Boolean),
+  );
+  for (const value of mergedToolMem.slice(0, 3)) {
+    recallItems.push({
+      source: "memos",
+      type: "tool_mem",
+      timestamp: 0,
+      text: value,
+    });
   }
 
-  // ── Section 2: MemOS Native Memories ─────────────────────────────────────
-  if (memosData) {
-    const memoryList = memosData.memory_detail_list || [];
-    const preferenceList = memosData.preference_detail_list || [];
-
-    if (memoryList.length > 0 || preferenceList.length > 0) {
-      lines.push("<memories>");
-      lines.push("  <facts>");
-
-      for (const m of memoryList.slice(0, topK)) {
-        const text = m.memory_value || m.memory_key || "";
-        if (!text) continue;
-        const time = formatTime(m.create_time);
-        const prefix = time ? `-[${time}]` : "";
-        lines.push(`     ${prefix} ${sanitizeText(text, 300)}`);
-      }
-
-      lines.push("  </facts>");
-      lines.push("  <preferences>");
-
-      for (const p of preferenceList.slice(0, 3)) {
-        const text = p.preference || "";
-        if (!text) continue;
-        const type = normalizePreferenceType(p.preference_type);
-        const typeLabel = type ? ` [${type}]` : "";
-        lines.push(`     ${typeLabel} ${sanitizeText(text, 200)}`);
-      }
-
-      lines.push("  </preferences>");
-      lines.push("</memories>");
-    }
-
-    // Tool memories (MemOS unique capability)
-    const toolList = memosData.tool_memory_detail_list || [];
-    if (toolList.length > 0) {
-      lines.push("");
-      lines.push("<tool-memories>");
-      for (const t of toolList.slice(0, 3)) {
-        const value = t.tool_value || "";
-        if (!value) continue;
-        lines.push(`  - ${sanitizeText(value, 200)}`);
-      }
-      lines.push("</tool-memories>");
-    }
+  const mergedSkillMem = dedupeTextEntries(skillMem.map((item) => item.text));
+  for (const value of mergedSkillMem.slice(0, 3)) {
+    recallItems.push({
+      source: "memos",
+      type: "skill_mem",
+      timestamp: 0,
+      text: value,
+    });
   }
 
-  const block = lines.join("\n");
+  const finalRenderedItems = dedupeTextEntries(
+    recallItems.map((item) => formatRecallItem(item)).filter(Boolean),
+  );
+
+  const block = finalRenderedItems.length > 0
+    ? ["", "<recall>", ...finalRenderedItems.map((item) => `  - ${item}`), "</recall>"].join("\n")
+    : "";
   return block || "";
 }
 
@@ -109,19 +90,147 @@ export function formatLanceDBOnly(results, options = {}) {
   const { topK = 4 } = options;
   if (!results || !results.length) return "";
 
-  const lines = [];
-  lines.push("<precision-memories>");
-  lines.push("  (High-precision memories from hybrid vector + BM25 retrieval with cross-encoder reranking)");
+  const recallItems = dedupeByNormalizedText(results).slice(0, topK).map((item) => ({
+    source: "lancedb",
+    type: item.category || "fact",
+    timestamp: item.timestamp || 0,
+    text: item.text || "",
+  }));
 
-  for (const r of results.slice(0, topK)) {
-    const time = formatTime(r.timestamp);
-    const cat = r.category || "fact";
-    const prefix = time ? `-[${time}]` : "";
-    lines.push(`     ${prefix}[${cat}] ${sanitizeText(r.text || "", 300)}`);
+  const renderedItems = recallItems
+    .map((item) => formatRecallItem(item))
+    .filter(Boolean);
+  if (renderedItems.length === 0) return "";
+
+  const lines = [];
+  lines.push("<recall>");
+  for (const item of renderedItems) {
+    lines.push(`  - ${item}`);
+  }
+  lines.push("</recall>");
+  return lines.join("\n");
+}
+
+function collectPrimaryRecallItems({
+  lancedbResults = [],
+  memosData = null,
+  unifiedResults = [],
+  textMem = [],
+  prefMem = [],
+  topK = 6,
+}) {
+  if (unifiedResults.length > 0) {
+    return dedupeByNormalizedText(unifiedResults).slice(0, topK).map((item) => ({
+      source: item.source || "unknown",
+      type: item.type || "fact",
+      timestamp: item.timestamp || item.raw?.create_time || item.raw?.timestamp || 0,
+      text: item.text || "",
+    }));
   }
 
-  lines.push("</precision-memories>");
-  return lines.join("\n");
+  const fallback = [];
+
+  for (const item of dedupeByNormalizedText(lancedbResults)) {
+    fallback.push({
+      source: "lancedb",
+      type: item.category || "fact",
+      timestamp: item.timestamp || 0,
+      text: item.text || "",
+    });
+  }
+
+  for (const item of dedupeByNormalizedText(textMem)) {
+    fallback.push({
+      source: item.source || "memos",
+      type: item.type || "text_mem",
+      timestamp: item.raw?.create_time || item.raw?.timestamp || 0,
+      text: item.text || "",
+    });
+  }
+
+  for (const item of dedupeByNormalizedText(prefMem)) {
+    fallback.push({
+      source: item.source || "memos",
+      type: item.type || "pref_mem",
+      timestamp: item.raw?.create_time || item.raw?.timestamp || 0,
+      text: item.text || "",
+    });
+  }
+
+  if (fallback.length > 0) {
+    return dedupeByNormalizedText(fallback).slice(0, topK);
+  }
+
+  const memoryList = Array.isArray(memosData?.memory_detail_list) ? memosData.memory_detail_list : [];
+  const preferenceList = Array.isArray(memosData?.preference_detail_list) ? memosData.preference_detail_list : [];
+  const rawFallback = [];
+
+  for (const item of memoryList) {
+    const text = item.memory_value || item.memory_key || "";
+    if (!text) continue;
+    rawFallback.push({
+      source: "memos",
+      type: "text_mem",
+      timestamp: item.create_time || 0,
+      text,
+    });
+  }
+
+  for (const item of preferenceList) {
+    const text = item.preference || "";
+    if (!text) continue;
+    rawFallback.push({
+      source: "memos",
+      type: normalizePreferenceType(item.preference_type) || "pref_mem",
+      timestamp: item.create_time || 0,
+      text,
+    });
+  }
+
+  return dedupeByNormalizedText(rawFallback).slice(0, topK);
+}
+
+function formatRecallItem(item) {
+  const source = item.source || "unknown";
+  const type = item.type || "fact";
+  const text = sanitizeText(item.text, 300);
+  if (!text) return "";
+  return `[${source}/${type}] ${text}`.trim();
+}
+
+function dedupeTextEntries(values = []) {
+  const seen = new Set();
+  const deduped = [];
+  for (const value of values) {
+    const text = sanitizeText(value, 1000);
+    const key = normalizeTextKey(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(text);
+  }
+  return deduped;
+}
+
+function dedupeByNormalizedText(items = []) {
+  const seen = new Set();
+  const deduped = [];
+  for (const item of items) {
+    const text = item?.text || "";
+    const key = normalizeTextKey(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped;
+}
+
+function normalizeTextKey(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 // ============================================================================
@@ -130,7 +239,46 @@ export function formatLanceDBOnly(results, options = {}) {
 
 function sanitizeText(text, maxLen) {
   if (!text) return "";
-  const cleaned = text.replace(/\r?\n+/g, " ").trim();
+
+  let cleaned = String(text)
+    .replace(/```json[\s\S]*?```/gi, " ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/<\/?(?:precision-memories|unified-recall|memories)>/gi, " ")
+    .replace(/\(High-precision memories from hybrid vector \+ BM25 retrieval with cross-encoder reranking\)/gi, " ")
+    .replace(/Conversation info\s*\(untrusted metadata\)\s*:/gi, " ")
+    .replace(/Sender\s*\(untrusted metadata\)\s*:/gi, " ")
+    .replace(/\bJSON metadata\b\s*:/gi, " ")
+    .replace(/\{\s*"(?:message_id|sender_id|sender|timestamp|label|id|name|username)"[\s\S]*?\}/gi, " ")
+    .replace(/\r?\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const previous = new Set();
+  while (cleaned && !previous.has(cleaned)) {
+    previous.add(cleaned);
+    cleaned = cleaned
+      .replace(/^[-•*]\s*[-•*]\s*(?=\[)/, "")
+      .replace(/^[-•*]\s+(?=-\[)/, "")
+      .replace(/^-\s*-\[/, "-[")
+      .replace(/^[-•*]\s*/, "")
+      .replace(/^(?:-\[[0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}\]\[[^\]]+\]\s*)+/, "")
+      .replace(/^(?:\[[^\]]+\]\[[^\]]+\]\s*)+/, "")
+      .replace(/^[:：,，;；\-\s]+/, "")
+      .trim();
+  }
+
+  cleaned = cleaned
+    .replace(/[：:，,;；\-]\s*-\[[0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}\]\[[^\]]+\]\s*/g, " ")
+    .replace(/\s+-\[[0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}\]\[[^\]]+\]\s*/g, " ")
+    .replace(/[：:，,;；]\s*\[[^\]]+\]\[[^\]]+\]\s*/g, " ")
+    .replace(/\s+\[[^\]]+\]\[[^\]]+\]\s*/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (/^\[[^\]]+\]\s*$/.test(cleaned) || /^-\[[^\]]+\]\s*$/.test(cleaned)) {
+    return "";
+  }
+
   if (cleaned.length > maxLen) {
     return cleaned.slice(0, maxLen) + "...";
   }

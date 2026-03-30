@@ -1,334 +1,151 @@
-# MemOS Cloud OpenClaw Plugin
+# MemOS Cloud OpenClaw Plugin（Lifecycle 插件）
 
-> **官方维护**：MemTensor | **版本**：0.1.7 | **协议**：MIT
+官方维护：MemTensor。
 
-一个为 OpenClaw / MoltBot / ClawdBot 设计的 **lifecycle 记忆增强插件**，
-提供 **双层混合检索**（本地 LanceDB + 云端 MemOS Cloud），让每个 AI Agent 拥有持久、精准、隔离的长期记忆能力。
+这是一个最小可用的 OpenClaw lifecycle 插件，功能是：
+- **召回记忆**：在每轮对话前从 MemOS Cloud 检索记忆并注入上下文
+- **添加记忆**：在每轮对话结束后把消息写回 MemOS Cloud
 
----
-
-## 核心功能
-
-| 功能 | 说明 |
-|------|------|
-| 📥 **记忆召回** | `before_agent_start` 触发，将相关记忆注入对话上下文 |
-| 📤 **记忆写入** | `agent_end` 触发，将每轮对话自动写回记忆库 |
-| 🏠 **本地精准层** | LanceDB 向量搜索 + BM25 → RRF 融合 → Cross-Encoder 重排 → MMR 去重 |
-| ☁️ **云端知识层** | MemOS Cloud 结构化记忆（事实/偏好/工具记忆/技能记忆） |
-| 🤖 **多 Agent 隔离** | 每个 Agent 独立记忆空间，`ctx.agentId` 自动路由，零配置隔离 |
-| ⚡ **性能优化** | Embedding LRU 缓存、Recall 结果缓存、节流限制、异步写入 |
-
----
-
-## 适用平台
-
-本插件基于标准 OpenClaw lifecycle 协议，可在以下平台使用（只要平台支持 lifecycle 插件）：
-
-- **OpenClaw** / **MoltBot** / **ClawdBot**（原生支持）
-- **Claude Desktop** / **Cursor** / **Codex** / **Gemini CLI**（需通过 OpenClaw Gateway 桥接）
-- **Antigravity** / 自定义 AI 工具（通过 `before_agent_start` / `agent_end` hook 接入）
-
----
+## 功能
+- **Recall**：`before_agent_start` → `/search/memory`
+- **Add**：`agent_end` → `/add/message`
+- 使用 **Token** 认证（`Authorization: Token <MEMOS_API_KEY>`）
 
 ## 安装
 
 ### 方式 A — NPM（推荐）
-
 ```bash
 openclaw plugins install @memtensor/memos-cloud-openclaw-plugin@latest
 openclaw gateway restart
 ```
 
-### 方式 B — 本地 Archive 安装
+> **Windows 用户注意**：
+> 如果遇到 `Error: spawn EINVAL` 报错，这是 OpenClaw Windows 安装器的已知问题。请使用下方的 **方式 B**（手动安装）。
 
-```bash
-openclaw plugins install --source archive /path/to/memos-cloud-openclaw-plugin.tgz
-openclaw gateway restart
-```
-
-### 方式 C — 手动安装（Windows）
-
-1. 从 [NPM](https://www.npmjs.com/package/@memtensor/memos-cloud-openclaw-plugin) 下载 `.tgz` 包
-2. 解压到 `~/.openclaw/extensions/memos-cloud-openclaw-plugin/`
-3. 在 `openclaw.json` 中手动添加 `plugins.load.paths` 指向该目录
-
----
-
-## 快速配置
-
-### 第一步：获取 API Key
-
-- MemOS API Key：[https://memos-dashboard.openmem.net/cn/apikeys/](https://memos-dashboard.openmem.net/cn/apikeys/)
-- SiliconFlow（BAAI/bge-m3 嵌入）：[https://siliconflow.cn/](https://siliconflow.cn/)
-- Jina（Cross-Encoder 重排，可选）：[https://jina.ai/](https://jina.ai/)
-
-### 第二步：配置 `~/.openclaw/openclaw.json`
-
+确认 `~/.openclaw/openclaw.json` 中已启用：
 ```json
 {
-  "env": {
-    "MEMOS_API_KEY": "krlk_your_memos_api_key_here"
-  },
   "plugins": {
-    "allow": ["memos-cloud-openclaw-plugin"],
     "entries": {
-      "memos-cloud-openclaw-plugin": {
-        "enabled": true,
-        "config": {
-          "recallEnabled": true,
-          "addEnabled": true,
-          "allowedAgentIds": ["boss", "dev", "telegram", "private_assistant"],
-          "dynamicUserIdFormat": "agent:user",
-          "dynamicTagMode": "agent-only",
-          "memoryScopeMode": "hybrid",
-          "memosSearchFallbackEnabled": true,
-          "memosSearchFallbackMode": "weak-or-empty",
-          "lancedb": {
-            "enabled": true,
-            "dbPath": "~/.openclaw/memory/lancedb",
-            "embedder": {
-              "apiKey": "sk-your_siliconflow_key",
-              "baseURL": "https://api.siliconflow.cn/v1",
-              "model": "BAAI/bge-m3",
-              "dimensions": 1024
-            }
-          }
-        }
-      }
+      "memos-cloud-openclaw-plugin": { "enabled": true }
     }
   }
 }
 ```
 
-### 第三步：重启 Gateway
-
-```bash
-openclaw gateway restart
-```
-
----
-
-## 完整配置参考
+### 方式 B — 手动安装（Windows 解决方案）
+1. 从 [NPM](https://www.npmjs.com/package/@memtensor/memos-cloud-openclaw-plugin) 下载最新的 `.tgz` 包。
+2. 解压到本地目录（例如 `C:\Users\YourName\.openclaw\extensions\memos-cloud-openclaw-plugin`）。
+3. 修改配置 `~/.openclaw/openclaw.json`（或 `%USERPROFILE%\.openclaw\openclaw.json`）：
 
 ```json
 {
-  "memos-cloud-openclaw-plugin": {
-    "enabled": true,
-    "config": {
-
-      "=== MemOS Cloud 连接 ===": "",
-      "baseUrl": "https://memos.memtensor.cn",
-      "apiKey": "",
-      "userId": "openclaw-user",
-
-      "=== 多 Agent 控制 ===": "",
-      "allowedAgentIds": ["boss", "dev", "telegram"],
-      "dynamicUserIdFormat": "agent:user",
-      "dynamicConversationPrefixMode": "agent",
-      "dynamicTagMode": "agent-only",
-      "memoryScopeMode": "hybrid",
-
-      "=== 召回行为 ===": "",
-      "recallEnabled": true,
-      "recallGlobal": false,
-      "memoryLimitNumber": 6,
-      "preferenceLimitNumber": 6,
-      "includePreference": true,
-      "includeToolMemory": false,
-      "memoryCacheTtlSec": 120,
-
-      "=== 写入行为 ===": "",
-      "addEnabled": true,
-      "captureStrategy": "last_turn",
-      "includeAssistant": true,
-      "maxMessageChars": 20000,
-      "asyncMode": true,
-      "retries": 1,
-      "throttleMs": 5000,
-
-      "=== MemOS 云端兜底 ===": "",
-      "memosSearchFallbackEnabled": true,
-      "memosSearchFallbackMode": "weak-or-empty",
-      "memosSearchFallbackMinScore": 0.4,
-
-      "=== LanceDB 本地精准层 ===": "",
-      "lancedb": {
-        "enabled": true,
-        "dbPath": "~/.openclaw/memory/lancedb",
-        "embedder": {
-          "apiKey": "sk-your_siliconflow_key",
-          "baseURL": "https://api.siliconflow.cn/v1",
-          "model": "BAAI/bge-m3",
-          "dimensions": 1024
-        },
-        "vectorWeight": 0.7,
-        "bm25Weight": 0.3,
-        "topK": 6,
-        "candidatePoolSize": 20,
-        "hardMinScore": 0.35,
-        "rerank": "cross-encoder",
-        "rerankApiKey": "jina_your_rerank_key",
-        "rerankModel": "jina-reranker-v3",
-        "rerankEndpoint": "https://api.jina.ai/v1/rerank",
-        "recencyWeight": 0.1,
-        "recencyHalfLifeDays": 14,
-        "filterNoise": true
-      }
+  "plugins": {
+    "entries": {
+      "memos-cloud-openclaw-plugin": { "enabled": true }
+    },
+    "load": {
+      "paths": [
+        "C:\\Users\\YourName\\.openclaw\\extensions\\memos-cloud-openclaw-plugin\\package"
+      ]
     }
   }
 }
 ```
+*注意：解压后的文件夹通常包含一个 `package` 子文件夹，请指向包含 `package.json` 的那层目录。*
 
----
+修改配置后需要重启 gateway。
 
-## 环境变量支持
+## 环境变量
+插件按顺序读取 env 文件（**openclaw → moltbot → clawdbot**），每个键优先使用最先匹配到的值。
+若该键在三个文件中都未找到，会按“键级别”回退到进程环境变量。
 
-插件按如下优先级顺序读取变量：
+**配置位置**
+- 文件（优先级顺序）：
+  - `~/.openclaw/.env`
+  - `~/.moltbot/.env`
+  - `~/.clawdbot/.env`
+- 每行格式：`KEY=value`
 
+**快速配置（Shell）**
+```bash
+echo 'export MEMOS_API_KEY="mpg-..."' >> ~/.zshrc
+source ~/.zshrc
+# 或者
+
+echo 'export MEMOS_API_KEY="mpg-..."' >> ~/.bashrc
+source ~/.bashrc
 ```
-~/.openclaw/.env  →  ~/.moltbot/.env  →  ~/.clawdbot/.env  →  process.env
+
+**快速配置（Windows PowerShell）**
+```powershell
+[System.Environment]::SetEnvironmentVariable("MEMOS_API_KEY", "mpg-...", "User")
 ```
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `MEMOS_API_KEY` | — | **必填**，MemOS Token 认证 |
-| `MEMOS_BASE_URL` | `https://memos.memtensor.cn` | MemOS 服务地址 |
-| `MEMOS_USER_ID` | `openclaw-user` | 静态 user_id（多 Agent 时被 dynamic 覆盖） |
-| `MEMOS_RECALL_GLOBAL` | `true` | 全局召回（不传 conversation_id） |
-| `MEMOS_DYNAMIC_USER_ID_FORMAT` | `agent` | `agent` 或 `agent:user` |
-| `MEMOS_DYNAMIC_TAG_MODE` | `agent-and-memos` | `agent-only` / `agent-and-memos` / `inherit` |
-| `MEMOS_DYNAMIC_CONVERSATION_PREFIX_MODE` | `agent` | `agent` 或 `inherit` |
-| `MEMORY_SCOPE_MODE` | `hybrid` | `user` / `chat` / `hybrid` |
-| `MEMORY_CACHE_TTL_SEC` | `60` | 召回结果缓存时间（秒） |
-| `MEMORY_DEGRADE_ON_ERROR` | `true` | 错误时优雅降级（不抛异常） |
-| `LANCEDB_EMBED_API_KEY` | — | LanceDB Embedder API Key |
-| `LANCEDB_EMBED_BASE_URL` | `https://api.siliconflow.cn/v1` | Embedder 地址 |
-| `JINA_RERANK_API_KEY` | — | Jina Cross-Encoder Reranker Key |
+若未读取到 `MEMOS_API_KEY`，插件会提示配置方式并附 API Key 获取地址。
 
----
+**最小配置**
+```env
+MEMOS_API_KEY=YOUR_TOKEN
+```
+
+**可选配置**
+- `MEMOS_BASE_URL`（默认 `https://memos.memtensor.cn/api/openmem/v1`）
+- `MEMOS_API_KEY`（必填，Token 认证）—— 获取地址：https://memos-dashboard.openmem.net/cn/apikeys/
+- `MEMOS_USER_ID`（可选，默认 `openclaw-user`）
+- `MEMOS_CONVERSATION_ID`（可选覆盖）
+- `MEMOS_RECALL_GLOBAL`（默认 `true`；为 true 时检索不传 conversation_id）
+- `MEMOS_CONVERSATION_PREFIX` / `MEMOS_CONVERSATION_SUFFIX`（可选）
+- `MEMOS_CONVERSATION_SUFFIX_MODE`（`none` | `counter`，默认 `none`）
+- `MEMOS_CONVERSATION_RESET_ON_NEW`（默认 `true`，需 hooks.internal.enabled）
+
+## 可选插件配置
+在 `plugins.entries.memos-cloud-openclaw-plugin.config` 中设置：
+```json
+{
+  "baseUrl": "https://memos.memtensor.cn/api/openmem/v1",
+  "apiKey": "YOUR_API_KEY",
+  "userId": "memos_user_123",
+  "conversationId": "openclaw-main",
+  "queryPrefix": "important user context preferences decisions ",
+  "recallEnabled": true,
+  "recallGlobal": true,
+  "addEnabled": true,
+  "captureStrategy": "last_turn",
+  "includeAssistant": true,
+  "conversationIdPrefix": "",
+  "conversationIdSuffix": "",
+  "conversationSuffixMode": "none",
+  "resetOnNew": true,
+  "memoryLimitNumber": 6,
+  "preferenceLimitNumber": 6,
+  "knowledgebaseIds": [],
+  "includePreference": true,
+  "includeToolMemory": false,
+  "toolMemoryLimitNumber": 6,
+  "tags": ["openclaw"],
+  "asyncMode": true
+}
+```
 
 ## 工作原理
+### 1) 召回（before_agent_start）
+- 组装 `/search/memory` 请求
+  - `user_id`、`query`（= prompt + 可选前缀）
+  - 默认**全局召回**：`recallGlobal=true` 时不传 `conversation_id`
+  - 可选 `filter` / `knowledgebase_ids`
+- 使用 `/search/memory` 结果按 MemOS 提示词模板（Role/System/Memory/Skill/Protocols）拼装，并通过 `prependContext` 注入
 
-### 召回流程（`before_agent_start`）
+### 2) 添加（agent_end）
+- 默认只写**最后一轮**（user + assistant）
+- 构造 `/add/message` 请求：
+  - `user_id`、`conversation_id`
+  - `messages` 列表
+  - 可选 `tags / info / agent_id / app_id`
 
-```
-用户消息 → 提取查询词（resolveRecallQuery）
-         → [可选] 命中召回缓存 → 直接返回
-         → LanceDB 本地召回
-             Embed 查询词 → 向量搜索 + BM25 检索
-             → RRF 融合 → 时间衰减 Boost
-             → Cross-Encoder 重排（如配置 Jina Key）
-             → 长度归一化 → MMR 去重
-         → getMemosFallbackDecision（判断是否需要云端兜底）
-         → [按需] MemOS Cloud 召回
-         → mergeAndFormat（融合双路结果）→ 注入 prependContext
-```
-
-### 写入流程（`agent_end`）
-
-```
-对话结束 → 节流检查（throttleMs）
-         → isAgentAllowed 白名单检查
-         → 提取消息（last_turn / full_session）
-         → shouldWriteMessage 质量过滤
-         → MemOS /product/add（异步）
-         → LanceDB.store.add（同步写入本地向量库）
-```
-
-### 多 Agent 记忆隔离
-
-```
-ctx.agentId = "telegram"
-  → userId    = "openclaw_telegram:user"       （dynamicUserIdFormat = "agent:user"）
-  → sessionId = "telegram:{sessionKey}"         （dynamicConversationPrefixMode = "agent"）
-  → scopeKey  = "default:openclaw:chat:{sessionKey}:user:openclaw_telegram:user"
-  → tags      = ["telegram"]                    （dynamicTagMode = "agent-only"）
-  → LanceDB scope filter: [scopeKey, "global"]  （只能看到自己的记忆）
-```
-
----
-
-## 多 Agent 最佳实践
-
-### 场景 1：多 Bot 独立记忆
-
-```json
-{
-  "allowedAgentIds": ["telegarm_bot", "feishu_bot", "discord_bot"],
-  "dynamicUserIdFormat": "agent:user",
-  "dynamicTagMode": "agent-only",
-  "memoryScopeMode": "hybrid"
-}
-```
-
-每个 Bot 自动使用 `ctx.agentId` 隔离，无需额外配置。
-
-### 场景 2：Team 共享记忆（boss 读取 dev 的记忆）
-
-目前需在 MemOS Cloud 侧配置 knowledgebase 共享，插件侧通过 `knowledgebaseIds` 引用。
-
-### 场景 3：会话重置（/new 命令）
-
-```json
-{
-  "conversationSuffixMode": "counter",
-  "resetOnNew": true
-}
-```
-
-需同时开启：
-```json
-{
-  "hooks": { "internal": { "enabled": true } }
-}
-```
-
-### 场景 4：灰度发布记忆功能
-
-```json
-{
-  "memoryGrayPercent": 50
-}
-```
-
-50% 的会话启用记忆，基于 `scopeKey` 哈希稳定分桶。
-
----
-
-## 常见问题
-
-### Q: 配置校验报 `must NOT have additional properties`
-
-**原因**：`allowedAgentIds` 等字段在旧版 `openclaw.plugin.json` 的 schema 中未声明。
-
-**解决**：
-1. 更新插件到最新版：`openclaw plugins install @memtensor/memos-cloud-openclaw-plugin@latest`
-2. 或手动修改 `openclaw.plugin.json`，将相关字段加入 `configSchema.properties`（参考本 README）
-
-### Q: 记忆没有生效（agent_skip 日志）
-
-日志出现 `recall.agent_skip` → 检查 `allowedAgentIds` 是否包含当前 agent 的 ID。
-日志出现 `add.agent_skip_missing_allowlist` → `allowedAgentIds` 为空数组，所有 agent 被屏蔽。
-
-### Q: LanceDB 没有启用
-
-检查：
-1. `lancedb.enabled` 是否为 `true`
-2. `lancedb.embedder.apiKey` 是否填写（或设置 `LANCEDB_EMBED_API_KEY` 环境变量）
-
-### Q: MEMOS_API_TOKEN 不生效
-
-插件读取的变量名是 `MEMOS_API_KEY`，不是 `MEMOS_API_TOKEN`。请修正 `env` 节点的键名。
-
-### Q: Cross-Encoder 重排没工作
-
-`rerank: "cross-encoder"` 需要配置 `rerankApiKey`（Jina API Key）或环境变量 `JINA_RERANK_API_KEY`。
-
----
+## 说明
+- 未显式指定 `conversation_id` 时，默认使用 OpenClaw `sessionKey`。**TODO**：后续考虑直接绑定 OpenClaw `sessionId`。
+- 可配置前后缀；`conversationSuffixMode=counter` 时会在 `/new` 递增（需 `hooks.internal.enabled`）。
 
 ## 致谢
-
-- [@MemTensor](https://github.com/MemTensor) — 插件原作者与维护者
-- [@anatolykoptev](https://www.linkedin.com/in/koptev) — 贡献者
-- [LanceDB](https://lancedb.github.io/) — 本地向量数据库
-- [Jina AI](https://jina.ai/) — Cross-Encoder 重排服务
+- 感谢 @anatolykoptev（Contributor）— 领英：https://www.linkedin.com/in/koptev?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app

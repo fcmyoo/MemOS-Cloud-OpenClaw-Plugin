@@ -115,9 +115,7 @@ export class MemoryStore {
   ftsSupported = false;
   ftsIndexCreated = false;
 
-  // BM25 document stats — tracked in-memory, fallback 500 words for cold start
-  _docCount = 0;
-  _totalDocLen = 0;
+  // BM25 document stats removed for local-first optimization
 
   /**
    * @param {{ dbPath: string, vectorDim: number }} config
@@ -131,12 +129,7 @@ export class MemoryStore {
     return this._vectorDim;
   }
 
-  /** Average document word-count for BM25 length normalization */
-  get avgDocLen() {
-    return this._docCount > 0
-      ? this._totalDocLen / this._docCount
-      : 500; // cold-start fallback: 500 words
-  }
+  // avgDocLen removed
 
   /** Ensure DB is initialized (idempotent) */
   async ensureInitialized() {
@@ -229,13 +222,6 @@ export class MemoryStore {
 
     await this.table.add([row]);
 
-    // Track BM25 document stats in-memory
-    const wordCount = text.split(/\s+/).filter(Boolean).length;
-    if (wordCount > 0) {
-      this._docCount++;
-      this._totalDocLen += wordCount;
-    }
-
     return row;
   }
 
@@ -301,72 +287,36 @@ export class MemoryStore {
     }));
   }
 
-  /** BM25 full-text search — uses FTS index if available, otherwise naive match */
+  /** BM25 full-text search — strictly requires FTS index, no memory fallback */
   async bm25Search(query, { limit = 10, scopeFilter } = {}) {
     await this.ensureInitialized();
 
     if (!this.ftsSupported) {
-      return this._naiveTextSearch(query, { limit, scopeFilter });
+      return []; // Fast graceful degrade
     }
 
     try {
-      let q = this.table.query();
+      let q = this.table.search(query).type("fts");
 
       if (scopeFilter) {
         const scopeConditions = scopeFilter.map((s) => `scope = "${s}"`).join(" OR ");
         q = q.where(scopeConditions);
       }
 
-      const results = await q.limit(limit * 2).toArray();
-      const avgLen = this.avgDocLen;
+      const results = await q.limit(limit).toArray();
 
-      const scored = results
-        .map((row, rank) => {
-          const score = bm25Score(row.text || "", query, avgLen);
-          return {
-            entry: row,
-            vector: Array.isArray(row.vector) ? row.vector : null,
-            score,
-            sources: { bm25: { score, rank } },
-          };
-        })
-        .filter((r) => r.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
-
-      return scored;
-    } catch {
-      return this._naiveTextSearch(query, { limit, scopeFilter });
-    }
-  }
-
-  /** Naive keyword fallback when FTS is unavailable */
-  async _naiveTextSearch(query, { limit = 10, scopeFilter } = {}) {
-    await this.ensureInitialized();
-
-    const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (!keywords.length) return [];
-
-    const results = await this.table.query().limit(200).toArray();
-    const avgLen = this.avgDocLen;
-
-    return results
-      .filter((row) => {
-        if (scopeFilter && !scopeFilter.includes(row.scope)) return false;
-        const text = (row.text || "").toLowerCase();
-        return keywords.some((kw) => text.includes(kw));
-      })
-      .map((row) => {
-        const score = bm25Score(row.text || "", query, avgLen);
+      return results.map((row, rank) => {
+        const score = 1.0; 
         return {
           entry: row,
           vector: Array.isArray(row.vector) ? row.vector : null,
           score,
-          sources: { bm25: { score, rank: 0 } },
+          sources: { bm25: { score, rank } },
         };
-      })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      });
+    } catch (err) {
+      return []; // FTS error, gracefully degrade
+    }
   }
 
   /** Delete by IDs */
@@ -379,8 +329,8 @@ export class MemoryStore {
   /** Get stats */
   async stats() {
     await this.ensureInitialized();
-    const total = await this.table.query().count();
-    return { total, avgDocLen: this.avgDocLen, docCount: this._docCount };
+    const total = await this.table.countDocuments();
+    return { total };
   }
 }
 
@@ -401,26 +351,7 @@ export function cosineSimilarity(a, b) {
   return denom === 0 ? 0 : dot / denom;
 }
 
-/**
- * BM25 term-frequency scoring with proper length normalization.
- * @param {string} doc   - document text
- * @param {string} query - search query
- * @param {number} avgLen - corpus average document word-count (default 500)
- * @param {number} k1
- * @param {number} b
- */
-function bm25Score(doc, query, avgLen = 500, k1 = 1.5, b = 0.75) {
-  const docLen = doc.split(/\s+/).filter(Boolean).length;
-  const keywords = query.toLowerCase().split(/\s+/).filter(Boolean);
 
-  let score = 0;
-  for (const term of keywords) {
-    const termFreq = (doc.toLowerCase().match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
-    if (termFreq === 0) continue;
-    score += termFreq / (termFreq + k1 * (1 - b + b * docLen / Math.max(avgLen, 1)));
-  }
-  return score;
-}
 
 // ============================================================================
 // Factory
