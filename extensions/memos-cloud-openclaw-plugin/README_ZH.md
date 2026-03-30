@@ -2,14 +2,15 @@
 
 官方维护：MemTensor。
 
-这是一个最小可用的 OpenClaw lifecycle 插件，功能是：
-- **召回记忆**：在每轮对话前从 MemOS Cloud 检索记忆并注入上下文
-- **添加记忆**：在每轮对话结束后把消息写回 MemOS Cloud
+这是一个具备 Edge-First (边缘优先) 架构的 OpenClaw lifecycle 插件，功能是：
+- **召回记忆**：在每轮对话前优先从本地 LanceDB 秒级检索记忆并注入上下文（支持远端 MemOS 兜底）
+- **添加记忆**：极速写回本地并异步冷备至 MemOS Cloud
 
 ## 功能
-- **Recall**：`before_agent_start` → `/search/memory`
-- **Add**：`agent_end` → `/add/message`
-- 使用 **Token** 认证（`Authorization: Token <MEMOS_API_KEY>`）
+- **Zero Latency**: 本地优先，无惧网络抖动，彻底解放 Node.js 事件循环
+- **Recall**：`before_agent_start` → 本地 LanceDB 检索 → (可选兜底) `/search/memory`
+- **Add**：`agent_end` → 同步写入本地 LanceDB + 异步 `/add/message` 备份
+- 使用 **Token** 认证（`Authorization: Token <MEMOS_API_KEY>`）进行数据同步
 
 ## 安装
 
@@ -124,24 +125,26 @@ MEMOS_API_KEY=YOUR_TOKEN
   "includeToolMemory": false,
   "toolMemoryLimitNumber": 6,
   "tags": ["openclaw"],
-  "asyncMode": true
+  "syncToCloud": true,
+  "fallbackToCloud": true,
+  "lancedb": {
+    "enabled": true,
+    "embedder": {
+      "model": "text-embedding-3-small"
+    }
+  }
 }
 ```
 
 ## 工作原理
 ### 1) 召回（before_agent_start）
-- 组装 `/search/memory` 请求
-  - `user_id`、`query`（= prompt + 可选前缀）
-  - 默认**全局召回**：`recallGlobal=true` 时不传 `conversation_id`
-  - 可选 `filter` / `knowledgebase_ids`
-- 使用 `/search/memory` 结果按 MemOS 提示词模板（Role/System/Memory/Skill/Protocols）拼装，并通过 `prependContext` 注入
+- **触发断路器**：首先在本地 LanceDB 执行基于向量与 FTS 全文索引的混合检索。由于是本地查询，此步网络延迟近乎为 0。
+- **本地直接返回**：如果本地检索分数达标，直接拼装上下文返回给大模型。
+- **云端兜底检索**：如果本地分数过低或未命中，且开启了 `fallbackToCloud`，则向远端发送 `/search/memory` 获取兜底数据。
 
 ### 2) 添加（agent_end）
-- 默认只写**最后一轮**（user + assistant）
-- 构造 `/add/message` 请求：
-  - `user_id`、`conversation_id`
-  - `messages` 列表
-  - 可选 `tags / info / agent_id / app_id`
+- **本地秒级落盘**：提取最后一轮会话并在内部生成向量（Embed），同步执行 LanceDB 的存储保证本地落盘，以便下一轮能够立即检索到刚说的话。
+- **云端异步冷备**：通过开启 `syncToCloud=true`，后台使用“发后不管”的形式发送异步 `/add/message` 请求上报远端 MemOS，此时即便没有网络也不会阻塞 Agent。
 
 ## 说明
 - 未显式指定 `conversation_id` 时，默认使用 OpenClaw `sessionKey`。**TODO**：后续考虑直接绑定 OpenClaw `sessionId`。

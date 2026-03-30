@@ -2,12 +2,13 @@
 
 Official plugin maintained by MemTensor.
 
-A minimal OpenClaw lifecycle plugin that **recalls** memories from MemOS Cloud before each run and **adds** new messages to MemOS Cloud after each run.
+An Edge-First OpenClaw lifecycle plugin that uses a local **LanceDB** database to **recall** memories instantly before each run, and **adds** new messages to the local database synchronously while backing them up to MemOS Cloud asynchronously.
 
 ## Features
-- **Recall**: `before_agent_start` → `/search/memory`
-- **Add**: `agent_end` → `/add/message`
-- Uses **Token** auth (`Authorization: Token <MEMOS_API_KEY>`)
+- **Local-First Architecture**: Ultra-low latency via local vector database, with cloud acting as an asynchronous cold backup.
+- **Recall**: `before_agent_start` → Local LanceDB Search → (Optional Fallback) `/search/memory`
+- **Add**: `agent_end` → Local LanceDB Add (Sync) + `/add/message` (Async Backup)
+- Uses **Token** auth (`Authorization: Token <MEMOS_API_KEY>`) for cloud sync.
 
 ## Install
 
@@ -121,21 +122,26 @@ In `plugins.entries.memos-cloud-openclaw-plugin.config`:
   "includePreference": true,
   "includeToolMemory": false,
   "toolMemoryLimitNumber": 6,
-  "relativity": 0.45,
   "tags": ["openclaw"],
-  "asyncMode": true
+  "syncToCloud": true,
+  "fallbackToCloud": true,
+  "lancedb": {
+    "enabled": true,
+    "embedder": {
+      "model": "text-embedding-3-small"
+    }
+  }
 }
 ```
 
 ## How it Works
 - **Recall** (`before_agent_start`)
-  - Builds a `/search/memory` request using `user_id`, `query` (= prompt + optional prefix), and optional filters.
-  - Default **global recall**: when `recallGlobal=true`, it does **not** pass `conversation_id`.
-  - Formats a MemOS prompt (Role/System/Memory/Skill/Protocols) from `/search/memory` results, then injects via `prependContext`.
+  - **Local Circuit Breaker**: First searches the local LanceDB using Hybrid Search (Vector + FTS). If the top score is adequate, it immediately injects the memory text without any network call.
+  - **Cloud Fallback**: Only if the local database yields no or weak results, and `fallbackToCloud` is true, it queries `/search/memory` remotely as a backup.
 
 - **Add** (`agent_end`)
-  - Builds a `/add/message` request with the **last turn** by default (user + assistant).
-  - Sends `messages` with `user_id`, `conversation_id`, and optional `tags/info/agent_id/app_id`.
+  - **Synchronous Disk Write**: Embeds the chat text and synchronous writes vectors into the local LanceDB to guarantee instant access for the next query.
+  - **Asynchronous Cloud Sync**: Triggers a detached `/add/message` request to the remote MemOS server, serving as network-agnostic persistence (`syncToCloud=true` by default).
 
 ## Notes
 - `conversation_id` defaults to OpenClaw `sessionKey` (unless `conversationId` is provided). **TODO**: consider binding to OpenClaw `sessionId` directly.
