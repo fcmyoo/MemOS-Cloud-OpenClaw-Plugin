@@ -369,12 +369,12 @@ export function buildConfig(pluginConfig = {}, options = {}) {
 
 export async function callApi({ baseUrl, apiKey, timeoutMs = 5000, retries = 1 }, path, body) {
   if (!apiKey) {
-    throw new Error("Missing MEMOS API key (Token auth)");
+    throw new Error("Missing MEMOS API key (Authorization header)");
   }
 
   const headers = {
     "Content-Type": "application/json",
-    Authorization: `Token ${apiKey}`,
+    Authorization: apiKey,
   };
 
   let lastError;
@@ -506,14 +506,14 @@ function buildPromptFromData(data, options = {}) {
   if (!hasContent) return "";
 
   const memoriesBlock = [
-    "<memories>",
+    "<recall>",
     "  <facts>",
     ...memoryLines,
     "  </facts>",
     "  <preferences>",
     ...preferenceLines,
     "  </preferences>",
-    "</memories>",
+    "</recall>",
   ];
 
   const lines = [

@@ -60,6 +60,8 @@ test("formatPromptBlock can read nested data.data payload", () => {
 
   const block = formatPromptBlock(result, { relativity: 0.1 });
   assert.ok(block.includes("user likes concise answers"));
+  assert.ok(block.includes("<recall>"));
+  assert.ok(!block.includes("<memories>"));
 });
 
 test("formatPromptBlock can read nested data.result payload", () => {
@@ -94,7 +96,7 @@ test("formatPromptBlock respects maxOutputChars budget", () => {
   assert.ok(block.endsWith(USER_QUERY_MARKER));
 });
 
-test("searchMemory uses /product/search with Token auth", async () => {
+test("searchMemory uses /product/search with Authorization header", async () => {
   const calls = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, init) => {
@@ -119,7 +121,7 @@ test("searchMemory uses /product/search with Token auth", async () => {
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://df.jxpro.vip/product/search");
-  assert.equal(calls[0].init?.headers?.Authorization, "Token token-123");
+  assert.equal(calls[0].init?.headers?.Authorization, "token-123");
 });
 
 test("addMessage uses /product/add", async () => {
@@ -147,4 +149,5 @@ test("addMessage uses /product/add", async () => {
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://df.jxpro.vip/product/add");
+  assert.equal(calls[0].init?.headers?.Authorization, "token-123");
 });

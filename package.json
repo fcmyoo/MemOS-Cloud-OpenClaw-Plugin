@@ -29,6 +29,10 @@
   "type": "module",
   "author": "MemTensor",
   "license": "MIT",
+  "dependencies": {
+    "@lancedb/lancedb": "^0.14.0",
+    "openai": "^4.70.0"
+  },
   "openclaw": {
     "extensions": [
       "./index.js"

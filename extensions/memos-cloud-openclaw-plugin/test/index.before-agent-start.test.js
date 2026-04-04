@@ -15,11 +15,7 @@ function createApi(pluginConfig = {}) {
       warn: (line) => logs.warn.push(line),
     },
     config: {
-      hooks: {
-        internal: {
-          enabled: false,
-        },
-      },
+      hooks: { internal: { enabled: false } },
     },
     on(name, handler) {
       listeners.set(name, handler);
@@ -30,24 +26,15 @@ function createApi(pluginConfig = {}) {
   };
 }
 
-function createRetrieverStub(results) {
+function createRetrieverStub(results, trace = { stages: [] }) {
   return {
     async retrieve() {
-      return {
-        results,
-        trace: { stages: [] },
-      };
+      return { results, trace };
     },
   };
 }
 
-function createMemosResult({
-  memoryDetailList = [],
-  preferenceDetailList = [],
-  textMem = [],
-  prefMem = [],
-  toolMem = [],
-} = {}) {
+function createMemosResult({ memoryDetailList = [], preferenceDetailList = [], textMem = [], prefMem = [], toolMem = [] } = {}) {
   return {
     data: {
       data: {
@@ -62,13 +49,7 @@ function createMemosResult({
   };
 }
 
-async function runBeforeAgentStart({
-  pluginConfig,
-  lancedbResults,
-  memosResult,
-  memosError,
-  memosCalls,
-}) {
+async function runBeforeAgentStart({ pluginConfig, lancedbResults, memosResult, memosError, memosCalls }) {
   __resetTestSeamsForTests();
   __setTestSeamsForTests({
     createEmbedder: () => ({ embed: async () => [] }),
@@ -83,11 +64,11 @@ async function runBeforeAgentStart({
   const api = createApi(pluginConfig);
   plugin.register(api);
   const handler = api.listeners.get("before_agent_start");
-  assert.ok(handler, "before_agent_start listener should be registered");
+  assert.ok(handler);
 
   try {
     return await handler(
-      { prompt: "帮我回忆一下之前的偏好" },
+      { prompt: "help me remember prior preferences" },
       { sessionKey: "s-1", sessionId: "sid-1" },
     );
   } finally {
@@ -95,30 +76,27 @@ async function runBeforeAgentStart({
   }
 }
 
-test("before_agent_start returns LanceDB-only precision block", async () => {
+test("before_agent_start returns LanceDB-only recall block", async () => {
   const memosCalls = [];
   const result = await runBeforeAgentStart({
     pluginConfig: {
       apiKey: "token-123",
       memoryGrayPercent: 100,
-      lancedb: {
-        enabled: true,
-        embedder: { apiKey: "embed-key" },
-      },
+      lancedb: { enabled: true, embedder: { apiKey: "embed-key" } },
     },
     lancedbResults: [
-      { text: "本地命中：用户喜欢简洁回复", score: 0.92, category: "preference", timestamp: 1710000000000 },
+      { text: "local hit: user prefers concise replies", score: 0.92, category: "preference", timestamp: 1710000000000 },
     ],
     memosResult: createMemosResult(),
     memosCalls,
   });
 
-  assert.ok(result?.prependContext.includes("<precision-memories>"));
-  assert.ok(result?.prependContext.includes("本地命中：用户喜欢简洁回复"));
+  assert.ok(result?.prependContext.includes("<recall>"));
+  assert.ok(result?.prependContext.includes("local hit: user prefers concise replies"));
   assert.equal(memosCalls.length, 0);
 });
 
-test("before_agent_start returns MemOS-only prompt block", async () => {
+test("before_agent_start returns MemOS-only recall block", async () => {
   const memosCalls = [];
   const result = await runBeforeAgentStart({
     pluginConfig: {
@@ -127,19 +105,15 @@ test("before_agent_start returns MemOS-only prompt block", async () => {
     },
     lancedbResults: [],
     memosResult: createMemosResult({
-      memoryDetailList: [
-        { memory_value: "远端事实：用户常用中文", relativity: 0.9 },
-      ],
-      preferenceDetailList: [
-        { preference: "远端偏好：先给结论", preference_type: "explicit_preference", relativity: 0.95 },
-      ],
+      memoryDetailList: [{ memory_value: "remote fact: user often uses Chinese", relativity: 0.9 }],
+      preferenceDetailList: [{ preference: "remote preference: give conclusion first", preference_type: "explicit_preference", relativity: 0.95 }],
     }),
     memosCalls,
   });
 
-  assert.ok(result?.prependContext.includes("<memories>"));
-  assert.ok(result?.prependContext.includes("远端事实：用户常用中文"));
-  assert.ok(result?.prependContext.includes("远端偏好：先给结论"));
+  assert.ok(result?.prependContext.includes("<recall>"));
+  assert.ok(result?.prependContext.includes("remote fact: user often uses Chinese"));
+  assert.ok(result?.prependContext.includes("remote preference: give conclusion first"));
   assert.equal(memosCalls.length, 1);
 });
 
@@ -152,39 +126,21 @@ test("before_agent_start merges LanceDB and MemOS when both are available", asyn
       memosSearchFallbackEnabled: true,
       memosSearchFallbackMode: "weak-or-empty",
       memosSearchFallbackMinScore: 0.95,
-      lancedb: {
-        enabled: true,
-        embedder: { apiKey: "embed-key" },
-      },
+      lancedb: { enabled: true, embedder: { apiKey: "embed-key" } },
     },
     lancedbResults: [
-      { text: "本地事实：用户偏好结构化输出", score: 0.6, category: "fact", timestamp: 1710000000000 },
+      { text: "local fact: user prefers structured output", score: 0.6, category: "fact", timestamp: 1710000000000 },
     ],
     memosResult: createMemosResult({
-      memoryDetailList: [
-        { memory_value: "远端事实：用户项目使用 OpenClaw", relativity: 0.88 },
-      ],
-      textMem: [
-        {
-          cube_id: "text_mem",
-          memories: [{ memory: "远端统一召回：OpenClaw 项目", relativity: 0.88 }],
-        },
-      ],
-      prefMem: [
-        {
-          cube_id: "pref_mem",
-          memories: [{ preference: "远端统一偏好：结论优先", relativity: 0.8 }],
-        },
-      ],
+      textMem: [{ cube_id: "text_mem", memories: [{ memory: "remote project uses OpenClaw", relativity: 0.88 }] }],
+      prefMem: [{ cube_id: "pref_mem", memories: [{ preference: "remote preference: lead with conclusion", relativity: 0.8 }] }],
     }),
     memosCalls,
   });
 
-  assert.ok(result?.prependContext.includes("<lancedb-precision>"));
-  assert.ok(result?.prependContext.includes("<unified-recall>"));
-  assert.ok(result?.prependContext.includes("<memories>"));
-  assert.ok(result?.prependContext.includes("本地事实：用户偏好结构化输出"));
-  assert.ok(result?.prependContext.includes("远端统一召回：OpenClaw 项目"));
+  assert.ok(result?.prependContext.includes("<recall>"));
+  assert.ok(result?.prependContext.includes("local fact: user prefers structured output"));
+  assert.ok(result?.prependContext.includes("remote project uses OpenClaw"));
   assert.equal(memosCalls.length, 1);
 });
 
@@ -197,31 +153,19 @@ test("before_agent_start falls back to MemOS on weak LanceDB hit", async () => {
       memosSearchFallbackEnabled: true,
       memosSearchFallbackMode: "weak-or-empty",
       memosSearchFallbackMinScore: 0.5,
-      lancedb: {
-        enabled: true,
-        embedder: { apiKey: "embed-key" },
-      },
+      lancedb: { enabled: true, embedder: { apiKey: "embed-key" } },
     },
     lancedbResults: [
-      { text: "本地弱命中", score: 0.2, category: "fact", timestamp: 1710000000000 },
+      { text: "weak local hit", score: 0.2, category: "fact", timestamp: 1710000000000 },
     ],
     memosResult: createMemosResult({
-      memoryDetailList: [
-        { memory_value: "远端补充命中", relativity: 0.9 },
-      ],
-      textMem: [
-        {
-          cube_id: "text_mem",
-          memories: [{ memory: "远端补充命中", relativity: 0.9 }],
-        },
-      ],
+      textMem: [{ cube_id: "text_mem", memories: [{ memory: "remote fallback hit", relativity: 0.9 }] }],
     }),
     memosCalls,
   });
 
-  assert.ok(result?.prependContext.includes("<lancedb-precision>"));
-  assert.ok(result?.prependContext.includes("<unified-recall>"));
-  assert.ok(result?.prependContext.includes("远端补充命中"));
+  assert.ok(result?.prependContext.includes("<recall>"));
+  assert.ok(result?.prependContext.includes("remote fallback hit"));
   assert.equal(memosCalls.length, 1);
 });
 
@@ -233,10 +177,7 @@ test("before_agent_start returns nothing on fallback miss", async () => {
       memoryGrayPercent: 100,
       memosSearchFallbackEnabled: true,
       memosSearchFallbackMode: "empty-only",
-      lancedb: {
-        enabled: true,
-        embedder: { apiKey: "embed-key" },
-      },
+      lancedb: { enabled: true, embedder: { apiKey: "embed-key" } },
     },
     lancedbResults: [],
     memosResult: createMemosResult(),

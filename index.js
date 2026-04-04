@@ -7,7 +7,7 @@ import {
   USER_QUERY_MARKER,
   searchMemory,
 } from "./lib/memos-cloud-api.js";
-let lastCaptureTime = 0;
+const captureTimes = new Map();
 const conversationCounters = new Map();
 const recallCache = new Map();
 const API_KEY_HELP_URL = "https://memos-dashboard.openmem.net/cn/apikeys/";
@@ -15,7 +15,7 @@ const ENV_FILE_SEARCH_HINTS = ["~/.openclaw/.env", "~/.moltbot/.env", "~/.clawdb
 const MEMOS_SOURCE = "openclaw";
 
 function warnMissingApiKey(log, context) {
-  const heading = "[memos-cloud] Missing MEMOS_API_KEY (Token auth)";
+  const heading = "[memos-cloud] Missing MEMOS_API_KEY (Authorization header)";
   const header = `${heading}${context ? `; ${context} skipped` : ""}. Configure it with:`;
   log.warn?.(
     [
@@ -77,7 +77,7 @@ function logEvent(log, level, event, fields = {}) {
 }
 
 function buildIdentity(cfg, ctx) {
-  const userId = cfg.userId || "openclaw-user";
+  const userId = resolveUserId(cfg, ctx);
   const chatId = ctx?.sessionKey || ctx?.sessionId || "default-chat";
   const threadId = ctx?.threadId || "";
   return {
@@ -87,6 +87,21 @@ function buildIdentity(cfg, ctx) {
     userId,
     threadId,
   };
+}
+
+function normalizeAgentId(value) {
+  if (value === undefined || value === null) return "";
+  return String(value)
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function resolveUserId(cfg, ctx) {
+  if (cfg.hasConfiguredUserId) return cfg.userId;
+  const runtimeAgentId = normalizeAgentId(ctx?.agentId);
+  if (runtimeAgentId) return `openclaw_${runtimeAgentId}`;
+  return cfg.userId || "openclaw-user";
 }
 
 function resolveScopeKey(cfg, ctx) {
@@ -139,19 +154,27 @@ function writeRecallCache(key, value, ttlSec) {
   });
 }
 
+function shouldThrottleCapture(cfg, ctx, now = Date.now()) {
+  if (!cfg.throttleMs || cfg.throttleMs <= 0) return false;
+  const scopeKey = resolveScopeKey(cfg, ctx);
+  const lastCaptureTime = captureTimes.get(scopeKey) ?? 0;
+  if (now - lastCaptureTime < cfg.throttleMs) return true;
+  captureTimes.set(scopeKey, now);
+  return false;
+}
+
 function buildSearchPayload(cfg, prompt, ctx) {
   const queryRaw = `${cfg.queryPrefix || ""}${prompt}`;
   const query =
     Number.isFinite(cfg.maxQueryChars) && cfg.maxQueryChars > 0
       ? queryRaw.slice(0, cfg.maxQueryChars)
       : queryRaw;
-  const scopeKey = resolveScopeKey(cfg, ctx);
+  const userId = resolveUserId(cfg, ctx);
 
   const payload = {
-    user_id: cfg.userId,
+    user_id: userId,
     query,
     source: MEMOS_SOURCE,
-    session_id: resolveSessionId(cfg, ctx),
   };
 
   if (!cfg.recallGlobal) payload.session_id = resolveSessionId(cfg, ctx);
@@ -173,7 +196,7 @@ function buildAddMessagePayload(cfg, messages, ctx) {
   const asyncMode = cfg.memoryWriteAsync ? "async" : "sync";
   const identity = buildIdentity(cfg, ctx);
   const payload = {
-    user_id: cfg.userId,
+    user_id: identity.userId,
     session_id: resolveSessionId(cfg, ctx),
     messages,
     source: MEMOS_SOURCE,
@@ -361,10 +384,9 @@ export default {
       const startedAt = Date.now();
 
       const now = Date.now();
-      if (cfg.throttleMs && now - lastCaptureTime < cfg.throttleMs) {
+      if (shouldThrottleCapture(cfg, ctx, now)) {
         return;
       }
-      lastCaptureTime = now;
 
       try {
         const messages =

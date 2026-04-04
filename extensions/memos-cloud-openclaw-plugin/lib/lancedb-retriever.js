@@ -24,8 +24,8 @@ export const DEFAULT_RETRIEVAL_CONFIG = {
   // Retrieval limits
   candidatePoolSize: 20,
   topK: 6,
-  minScore: 0.3,
-  hardMinScore: 0.35,
+  minScore: 0.005,
+  hardMinScore: 0.005,
 
   // Rerank
   rerank: "cross-encoder",  // "cross-encoder" | "lightweight" | "none"
@@ -443,7 +443,7 @@ export function createRetriever(lancedbConfig, embedder = null) {
     candidatePoolSize: lancedbConfig?.candidatePoolSize ?? 20,
     topK: lancedbConfig?.topK ?? 6,
     minScore: lancedbConfig?.minScore ?? 0.3,
-    hardMinScore: lancedbConfig?.hardMinScore ?? 0.35,
+  hardMinScore: lancedbConfig?.hardMinScore ?? 0.005,
     rerank: lancedbConfig?.rerank ?? "none",
     rerankApiKey: lancedbConfig?.rerankApiKey || process.env.JINA_RERANK_API_KEY || process.env.LANCEDB_RERANK_API_KEY,
     rerankModel: lancedbConfig?.rerankModel || "jina-reranker-v3",

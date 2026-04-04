@@ -12,6 +12,7 @@ import {
   addMessage,
   buildConfig,
   extractText,
+  formatPromptBlock,
   USER_QUERY_MARKER,
   searchMemory,
 } from "./lib/memos-cloud-api.js";
@@ -19,6 +20,54 @@ import {
 // ── LanceDB Integration ───────────────────────────────────────────────────────
 import { createEmbedder } from "./lib/lancedb-embedder.js";
 import { createRetriever } from "./lib/lancedb-retriever.js";
+import { mergeAndFormat, formatLanceDBOnly } from "./lib/lancedb-fusion.js";
+import { getMemosFallbackDecision } from "./lib/memos-fallback.js";
+import { normalizeMemosSearchResult } from "./lib/memos-result-normalizer.js";
+import { buildUnifiedRecallResults, summarizeUnifiedRecall } from "./lib/unified-recall.js";
+
+function buildRecallTrace({
+  lancedbResults = [],
+  lancedbTrace = null,
+  fallbackDecision = null,
+  memosNormalized = null,
+  unifiedResults = [],
+} = {}) {
+  const lancedbTopScore = Number(lancedbResults[0]?.score ?? fallbackDecision?.topScore ?? 0);
+  const fallbackReason = fallbackDecision?.reason || "not_needed";
+  const memosSummary = memosNormalized?.summary || {
+    textMem: 0,
+    prefMem: 0,
+    toolMem: 0,
+    skillMem: 0,
+    actMem: 0,
+    paraMem: 0,
+  };
+  const unifiedPreview = summarizeUnifiedRecall(
+    unifiedResults.length > 0 ? unifiedResults : buildUnifiedRecallResults(lancedbResults, memosNormalized),
+    5,
+  );
+
+  return {
+    lancedb: {
+      count: lancedbResults.length,
+      top_score: lancedbTopScore,
+      trace: lancedbTrace,
+    },
+    fallback: {
+      enabled: Boolean(fallbackDecision),
+      reason: fallbackReason,
+      lancedb_top_score: lancedbTopScore,
+      should_fallback: Boolean(fallbackDecision?.shouldFallback),
+    },
+    memos: {
+      summary: memosSummary,
+    },
+    unified: {
+      count: unifiedResults.length > 0 ? unifiedResults.length : lancedbResults.length,
+      preview: unifiedPreview,
+    },
+  };
+}
 function formatRecallResults(results) {
   if (!results || results.length === 0) return "";
   let out = "<recall>\\n";
@@ -119,7 +168,7 @@ function initLanceDB(cfg) {
 // ── MemOS Core Utilities ─────────────────────────────────────────────────────
 
 function warnMissingApiKey(log, context) {
-  const heading = "[memos-cloud] Missing MEMOS_API_KEY (Token auth)";
+  const heading = "[memos-cloud] Missing MEMOS_API_KEY (Authorization header)";
   const header = `${heading}${context ? `; ${context} skipped` : ""}. Configure it with:`;
   log.warn?.(
     [
@@ -242,7 +291,7 @@ function inferCategory(text) {
 }
 
 function isAgentAllowed(cfg, ctx) {
-  if (!Array.isArray(cfg.allowedAgentIds) || cfg.allowedAgentIds.length === 0) return false;
+  if (!Array.isArray(cfg.allowedAgentIds) || cfg.allowedAgentIds.length === 0) return true;
   const runtimeAgentId = resolveRuntimeAgentId(cfg, ctx);
   return cfg.allowedAgentIds.includes(runtimeAgentId);
 }
@@ -382,7 +431,6 @@ function buildSearchPayload(cfg, prompt, ctx) {
     user_id: identity.userId,
     query,
     source: MEMOS_SOURCE,
-    session_id: resolveSessionId(cfg, ctx),
   };
 
   if (!cfg.recallGlobal) payload.session_id = resolveSessionId(cfg, ctx);
@@ -515,6 +563,9 @@ export function __resetTestSeamsForTests() {
   TEST_SEAMS.searchMemory = searchMemory;
   lancedbRetriever = null;
   lancedbInitialized = false;
+  lastCaptureTime = 0;
+  conversationCounters.clear();
+  recallCache.clear();
 }
 
 // ── Main Plugin ───────────────────────────────────────────────────────────────
@@ -606,7 +657,7 @@ export default {
 
         // ── Step 1: LanceDB Principal Engine ─────────────
         let lancedbResults = [];
-        let localTopScore = 0;
+        let lancedbTrace = null;
 
         if (lancedbEnabled && lancedbRetriever) {
           try {
@@ -614,11 +665,11 @@ export default {
               scopeFilter: [resolveScopeKey(cfg, ctx), "global"],
             });
             lancedbResults = ldbOutput.results || [];
-            localTopScore = lancedbResults[0]?.score || 0;
+            lancedbTrace = ldbOutput.trace || null;
             logEvent(log, "info", "lancedb.recall", {
               trace_id: traceId,
               count: lancedbResults.length,
-              top_score: localTopScore
+              top_score: lancedbResults[0]?.score || 0,
             });
           } catch (err) {
             log.warn?.(`[memos-cloud] LanceDB recall error: ${err.message}`);
@@ -626,32 +677,41 @@ export default {
         }
 
         // Circuit Breaker: If we have strong local results, return immediately!
-        if (lancedbResults.length > 0 && (localTopScore > 0.3 || cfg.fallbackToCloud === false)) {
-          const prependContext = formatRecallResults(lancedbResults);
-          
-          writeRecallCache(recallCacheKey, { prependContext, total_chars: prependContext.length }, cfg.memoryCacheTtlSec);
-          return { prependContext, total_chars: prependContext.length };
-        }
+        const fallbackDecision = getMemosFallbackDecision(cfg, lancedbResults);
+        const shouldRecallMemos = cfg.apiKey && (!lancedbEnabled || !lancedbRetriever || fallbackDecision.shouldFallback);
 
-        // ── Step 2: MemOS Cloud Fallback (if allowed and needed) ─────
-        let prependContext = "";
+        let memosData = null;
+        let memosNormalized = null;
+        let unifiedResults = buildUnifiedRecallResults(lancedbResults, null);
         let memosSuccess = false;
 
-        const shouldFallback = cfg.fallbackToCloud !== false && cfg.apiKey;
-        if (shouldFallback) {
+        // ── Step 2: MemOS Cloud Fallback (if allowed and needed) ─────
+        if (shouldRecallMemos) {
           try {
-            const payload = buildSearchPayload(cfg, recallQuery, ctx);
+            const payload = buildSearchPayload(cfg, prompt, ctx);
             const memosResult = await TEST_SEAMS.searchMemory(
               { ...cfg, timeoutMs: cfg.memorySearchTimeoutMs, retries: 0 },
               payload,
             );
-            
-            const memosData = memosResult?.data?.data || memosResult?.data || [];
-            if (memosData?.length > 0) {
-               prependContext = formatRecallResults(memosData);
-               memosSuccess = true;
-               logEvent(log, "info", "memos.recall", { trace_id: traceId, has_data: true });
-            }
+
+            memosData = memosResult;
+            memosNormalized = normalizeMemosSearchResult(memosResult);
+            unifiedResults = buildUnifiedRecallResults(lancedbResults, memosNormalized);
+            memosSuccess = true;
+            logEvent(log, "info", "memos.recall", {
+              trace_id: traceId,
+              elapsed_ms: Date.now() - startedAt,
+              lancedb_count: lancedbResults.length,
+              fallback_mode: cfg.memosSearchFallbackMode,
+              fallback_enabled: cfg.memosSearchFallbackEnabled,
+              recall: buildRecallTrace({
+                lancedbResults,
+                lancedbTrace,
+                fallbackDecision,
+                memosNormalized,
+                unifiedResults,
+              }),
+            });
           } catch (err) {
             log.warn?.(`[memos-cloud] MemOS recall error: ${err.message}`);
           }
@@ -659,15 +719,56 @@ export default {
           warnMissingApiKey(log, "recall");
         }
 
-        // If cloud gives nothing but we had weak local results, just use local as a last resort
-        if (!prependContext && lancedbResults.length > 0) {
-          prependContext = formatRecallResults(lancedbResults);
+        const recallTrace = buildRecallTrace({
+          lancedbResults,
+          lancedbTrace,
+          fallbackDecision,
+          memosNormalized,
+          unifiedResults,
+        });
+
+        let prependContext = "";
+
+        if (lancedbResults.length > 0 && memosData) {
+          prependContext = mergeAndFormat(lancedbResults, memosData?.data?.data || memosData?.data, {
+            topK: cfg.memoryTopK,
+            lancedbPriority: 3,
+            normalizedMemos: memosNormalized,
+            unifiedResults,
+          });
+        } else if (lancedbResults.length > 0) {
+          prependContext = formatLanceDBOnly(lancedbResults, { topK: 4 });
+        } else if (memosSuccess && memosData) {
+          prependContext = formatPromptBlock(memosData, {
+            wrapTagBlocks: true,
+            relativity: cfg.relativity,
+            maxOutputChars: cfg.memoryBudgetTokens * 4,
+          }) || "";
         }
 
         if (!prependContext) return;
 
-        writeRecallCache(recallCacheKey, { prependContext, total_chars: prependContext.length }, cfg.memoryCacheTtlSec);
-        return { prependContext, total_chars: prependContext.length };
+        logEvent(log, "info", "recall.success", {
+          trace_id: traceId,
+          cost_ms: Date.now() - startedAt,
+          lancedb_count: lancedbResults.length,
+          memos_success: memosSuccess,
+          recall: recallTrace,
+          total_chars: prependContext.length,
+        });
+
+        writeRecallCache(recallCacheKey, {
+          prependContext,
+          total_chars: prependContext.length,
+          unifiedResults,
+          trace: recallTrace,
+        }, cfg.memoryCacheTtlSec);
+        return {
+          prependContext,
+          total_chars: prependContext.length,
+          unifiedResults,
+          trace: recallTrace,
+        };
       } catch (err) {
         logEvent(log, "warn", "recall.failed", {
           trace_id: traceId,

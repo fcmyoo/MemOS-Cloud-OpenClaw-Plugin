@@ -5,8 +5,6 @@ import plugin, {
   __setTestSeamsForTests,
 } from "../index.js";
 
-process.env.MEMOS_API_KEY = "test-key";
-
 function createApi(pluginConfig = {}) {
   const listeners = new Map();
   const logs = { info: [], warn: [] };
@@ -17,11 +15,7 @@ function createApi(pluginConfig = {}) {
       warn: (line) => logs.warn.push(line),
     },
     config: {
-      hooks: {
-        internal: {
-          enabled: false,
-        },
-      },
+      hooks: { internal: { enabled: false } },
     },
     on(name, handler) {
       listeners.set(name, handler);
@@ -37,7 +31,7 @@ function createRetrieverStub(results) {
     async retrieve() {
       return {
         results,
-        trace: { stages: [{ name: "final_filter", outputCount: results.length }] },
+        trace: { stages: [{ name: "rrf_fusion", outputCount: results.length }] },
       };
     },
   };
@@ -70,7 +64,7 @@ function parseLogEntry(line) {
 
 function parseInfoLogs(logs) {
   return logs.info
-    .filter((line) => line.includes("{\"event\":"))
+    .filter((line) => line.includes('{"event":'))
     .map(parseLogEntry);
 }
 
@@ -88,7 +82,10 @@ async function runBeforeAgentStart({ pluginConfig, lancedbResults, memosResult }
   assert.ok(handler);
 
   try {
-    const result = await handler({ prompt: "帮我回忆一下之前的偏好" }, { sessionKey: "s-1", sessionId: "sid-1" });
+    const result = await handler(
+      { prompt: "help me remember earlier preferences" },
+      { sessionKey: "s-1", sessionId: "sid-1" },
+    );
     return { result, logs: api.logs };
   } finally {
     __resetTestSeamsForTests();
@@ -103,20 +100,13 @@ test("buildRecallTrace shape is logged when recall succeeds", async () => {
     },
     lancedbResults: [],
     memosResult: createMemosResult({
-      textMem: [
-        {
-          cube_id: "text_mem",
-          memories: [{ memory: "远端记忆", relativity: 0.66, create_time: 123 }],
-        },
-      ],
+      textMem: [{ cube_id: "text_mem", memories: [{ memory: "remote memory", relativity: 0.66, create_time: 123 }] }],
     }),
   });
 
-  assert.ok(result?.prependContext.includes("远端记忆"));
+  assert.ok(result?.prependContext.includes("remote memory"));
 
-  const success = parseInfoLogs(logs)
-    .find((entry) => entry.event === "recall.success");
-
+  const success = parseInfoLogs(logs).find((entry) => entry.event === "recall.success");
   assert.ok(success?.recall);
   assert.deepEqual(Object.keys(success.recall), ["lancedb", "fallback", "memos", "unified"]);
   assert.equal(success.recall.fallback.reason, "disabled");
@@ -130,7 +120,7 @@ test("buildRecallTrace shape is logged when recall succeeds", async () => {
     paraMem: 0,
   });
   assert.deepEqual(success.recall.unified.preview, [
-    { source: "memos", type: "text_mem", score: 0.66, text: "远端记忆" },
+    { source: "memos", type: "text_mem", score: 0.66, text: "remote memory" },
   ]);
 });
 
@@ -148,16 +138,14 @@ test("LanceDB-only unified preview remains consumable", async () => {
       },
     },
     lancedbResults: [
-      { text: "仅本地记忆", score: 0.91, category: "fact", timestamp: 1710000000000 },
+      { text: "local memory only", score: 0.91, category: "fact", timestamp: 1710000000000 },
     ],
     memosResult: createMemosResult(),
   });
 
-  assert.ok(result?.prependContext.includes("仅本地记忆"));
+  assert.ok(result?.prependContext.includes("local memory only"));
 
-  const success = parseInfoLogs(logs)
-    .find((entry) => entry.event === "recall.success");
-
+  const success = parseInfoLogs(logs).find((entry) => entry.event === "recall.success");
   assert.ok(success?.recall);
   assert.deepEqual(Object.keys(success.recall), ["lancedb", "fallback", "memos", "unified"]);
   assert.equal(success.recall.fallback.reason, "strong_local_results");
@@ -171,6 +159,6 @@ test("LanceDB-only unified preview remains consumable", async () => {
     paraMem: 0,
   });
   assert.deepEqual(success.recall.unified.preview, [
-    { source: "lancedb", type: "fact", score: 0.91, text: "仅本地记忆" },
+    { source: "lancedb", type: "fact", score: 0.91, text: "local memory only" },
   ]);
 });

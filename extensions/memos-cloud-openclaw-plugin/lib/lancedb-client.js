@@ -191,7 +191,7 @@ export class MemoryStore {
         scope: "global",
         importance: 0.5,
         timestamp: 0.0,
-        metadata: null,
+        metadata: "",
       },
     ];
     this.table = await this.db.createTable(TABLE_NAME, sampleData);
@@ -217,7 +217,12 @@ export class MemoryStore {
       scope: entry.scope || "global",
       importance: entry.importance ?? 0.5,
       timestamp: entry.timestamp || now,
-      metadata: entry.metadata || null,
+      metadata:
+        typeof entry.metadata === "string"
+          ? entry.metadata
+          : entry.metadata
+            ? JSON.stringify(entry.metadata)
+            : "",
     };
 
     await this.table.add([row]);

@@ -63,8 +63,8 @@ test("plugin uses consistent session_id for search and add when conversationId i
       {
         success: true,
         messages: [
-          { role: "user", content: "q1" },
-          { role: "assistant", content: "a1" },
+          { role: "user", content: "please remember this fixed conversation id scenario" },
+          { role: "assistant", content: "acknowledged, i will store this under the configured conversation id." },
         ],
       },
       { sessionKey: "s-1", sessionId: "sid-1" },

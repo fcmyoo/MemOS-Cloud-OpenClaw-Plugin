@@ -5,9 +5,9 @@ Official plugin maintained by MemTensor.
 A minimal OpenClaw lifecycle plugin that **recalls** memories from MemOS Cloud before each run and **adds** new messages to MemOS Cloud after each run.
 
 ## Features
-- **Recall**: `before_agent_start` → `/search/memory`
-- **Add**: `agent_end` → `/add/message`
-- Uses **Token** auth (`Authorization: Token <MEMOS_API_KEY>`)
+- **Recall**: `before_agent_start` → `/product/search`
+- **Add**: `agent_end` → `/product/add`
+- Uses header auth (`Authorization: <MEMOS_API_KEY>`)
 
 ## Install
 
@@ -88,20 +88,31 @@ MEMOS_API_KEY=YOUR_TOKEN
 ```
 
 **Optional config**
-- `MEMOS_BASE_URL` (default: `https://memos.memtensor.cn/api/openmem/v1`)
-- `MEMOS_API_KEY` (required; Token auth) — get it at https://memos-dashboard.openmem.net/cn/apikeys/
-- `MEMOS_USER_ID` (optional; default: `openclaw-user`)
+- `MEMOS_BASE_URL` (default: `https://memos.memtensor.cn`)
+- `MEMOS_API_KEY` (required; sent as `Authorization` header) — get it at https://memos-dashboard.openmem.net/cn/apikeys/
+- `MEMOS_USER_ID` (optional; if unset, defaults to runtime `openclaw_<agentId>`, otherwise `openclaw-user`)
 - `MEMOS_CONVERSATION_ID` (optional override)
 - `MEMOS_RECALL_GLOBAL` (default: `true`; when true, search does **not** pass conversation_id)
 - `MEMOS_CONVERSATION_PREFIX` / `MEMOS_CONVERSATION_SUFFIX` (optional)
 - `MEMOS_CONVERSATION_SUFFIX_MODE` (`none` | `counter`, default: `none`)
 - `MEMOS_CONVERSATION_RESET_ON_NEW` (default: `true`, requires hooks.internal.enabled)
+- `MEMORY_ENABLED` (default: `true`)
+- `MEMORY_TOP_K` (default: `5`)
+- `MEMORY_BUDGET_TOKENS` (default: `800`, caps injected memory context size)
+- `MEMORY_SEARCH_TIMEOUT_MS` (default: `1000`)
+- `MEMORY_WRITE_ASYNC` (default: `true`)
+- `MEMORY_WRITE_RETRY` (default: `2`)
+- `MEMORY_CACHE_TTL_SEC` (default: `60`)
+- `MEMORY_SCOPE_MODE` (`user` | `chat` | `hybrid`, default: `hybrid`)
+- `MEMORY_PII_FILTER_ENABLED` (default: `true`, reserved switch for filtering pipeline)
+- `MEMORY_DEGRADE_ON_ERROR` (default: `true`)
+- `MEMORY_GRAY_PERCENT` (default: `100`, stable rollout percentage in `0-100`)
 
 ## Optional Plugin Config
 In `plugins.entries.memos-cloud-openclaw-plugin.config`:
 ```json
 {
-  "baseUrl": "https://memos.memtensor.cn/api/openmem/v1",
+  "baseUrl": "https://memos.memtensor.cn",
   "apiKey": "YOUR_API_KEY",
   "userId": "memos_user_123",
   "conversationId": "openclaw-main",
@@ -129,17 +140,20 @@ In `plugins.entries.memos-cloud-openclaw-plugin.config`:
 
 ## How it Works
 - **Recall** (`before_agent_start`)
-  - Builds a `/search/memory` request using `user_id`, `query` (= prompt + optional prefix), and optional filters.
-  - Default **global recall**: when `recallGlobal=true`, it does **not** pass `conversation_id`.
-  - Formats a MemOS prompt (Role/System/Memory/Skill/Protocols) from `/search/memory` results, then injects via `prependContext`.
+  - Builds a `/product/search` request using `user_id`, `query` (= prompt + optional prefix), and scope-aware `session_id`.
+  - `session_id` is derived from `tenantId + channel + scope` based on `MEMORY_SCOPE_MODE`.
+  - Formats a MemOS prompt (Role/System/Memory/Skill/Protocols) from `/product/search` results, then injects via `prependContext`.
+  - Injection size is bounded by `MEMORY_BUDGET_TOKENS`, with short-lived cache via `MEMORY_CACHE_TTL_SEC`.
 
 - **Add** (`agent_end`)
-  - Builds a `/add/message` request with the **last turn** by default (user + assistant).
-  - Sends `messages` with `user_id`, `conversation_id`, and optional `tags/info/agent_id/app_id`.
+  - Builds a `/product/add` request with the **last turn** by default (user + assistant).
+  - Sends `messages` with `user_id`, `session_id`, optional `custom_tags/info/writable_cube_ids`, and `async_mode`.
 
 ## Notes
-- `conversation_id` defaults to OpenClaw `sessionKey` (unless `conversationId` is provided). **TODO**: consider binding to OpenClaw `sessionId` directly.
+- `session_id` defaults to `tenantId + channel + scope` (unless overridden by `conversationId` settings).
 - Optional **prefix/suffix** via env or config; `conversationSuffixMode=counter` increments on `/new` (requires `hooks.internal.enabled`).
+- If MemOS fails and `MEMORY_DEGRADE_ON_ERROR=true`, the plugin degrades gracefully and does not block the main reply path.
+- Stable gray rollout is supported: hashing by `scope_key`; `MEMORY_GRAY_PERCENT=10` enables memory enhancement for about 10% of contexts.
 
 ## Acknowledgements
 - Thanks to @anatolykoptev (Contributor) — LinkedIn: https://www.linkedin.com/in/koptev?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=ios_app

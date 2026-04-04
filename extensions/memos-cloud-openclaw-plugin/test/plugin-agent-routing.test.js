@@ -64,8 +64,8 @@ test("plugin routes recall and add by ctx.agentId at runtime", async () => {
       {
         success: true,
         messages: [
-          { role: "user", content: "q1" },
-          { role: "assistant", content: "a1" },
+          { role: "user", content: "please remember that i prefer concise answers" },
+          { role: "assistant", content: "understood, i will keep future replies concise and structured." },
         ],
       },
       { agentId: "finance", sessionKey: "s-1", sessionId: "sid-1" },
@@ -75,9 +75,9 @@ test("plugin routes recall and add by ctx.agentId at runtime", async () => {
   }
 
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].user_id, "finance");
+  assert.equal(calls[0].user_id, "openclaw_finance");
   assert.equal(calls[0].session_id, "finance:s-1");
-  assert.equal(calls[1].user_id, "finance");
+  assert.equal(calls[1].user_id, "openclaw_finance");
   assert.equal(calls[1].session_id, "finance:s-1");
   assert.deepEqual(calls[1].custom_tags, ["finance", "memos"]);
   assert.equal(calls[1].info.agent_id, "finance");
@@ -121,7 +121,7 @@ test("plugin falls back to ctx.sessionKey when ctx.agentId is missing", async ()
   }
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].user_id, "strategy-room");
+  assert.equal(calls[0].user_id, "openclaw_strategy-room");
   assert.equal(calls[0].session_id, "strategy-room:strategy-room");
 });
 

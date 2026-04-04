@@ -14,11 +14,11 @@
       },
       "apiKey": {
         "type": "string",
-        "description": "MemOS API Key (Token auth; supports ~/.openclaw/.env, ~/.moltbot/.env, ~/.clawdbot/.env; falls back to process env)"
+        "description": "MemOS API Key (Authorization header; supports ~/.openclaw/.env, ~/.moltbot/.env, ~/.clawdbot/.env; falls back to process env)"
       },
       "userId": {
         "type": "string",
-        "description": "MemOS user_id (default: openclaw-user)",
+        "description": "MemOS user_id (optional; defaults to runtime agent as openclaw_<agentId>, otherwise openclaw-user)",
         "default": "openclaw-user"
       },
       "conversationId": {
@@ -153,6 +153,63 @@
       "throttleMs": {
         "type": "integer",
         "default": 0
+      },
+      "memoryEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "memoryTopK": {
+        "type": "integer",
+        "default": 5
+      },
+      "memoryBudgetTokens": {
+        "type": "integer",
+        "default": 800
+      },
+      "memorySearchTimeoutMs": {
+        "type": "integer",
+        "default": 1000
+      },
+      "memoryWriteAsync": {
+        "type": "boolean",
+        "default": true
+      },
+      "memoryWriteRetry": {
+        "type": "integer",
+        "default": 2
+      },
+      "memoryCacheTtlSec": {
+        "type": "integer",
+        "default": 60
+      },
+      "memoryScopeMode": {
+        "type": "string",
+        "enum": [
+          "user",
+          "chat",
+          "hybrid"
+        ],
+        "default": "hybrid"
+      },
+      "memoryPiiFilterEnabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "memoryDegradeOnError": {
+        "type": "boolean",
+        "default": true
+      },
+      "memoryGrayPercent": {
+        "type": "integer",
+        "default": 100
+      },
+      "tenantId": {
+        "type": "string",
+        "default": "default"
+      },
+      "channel": {
+        "type": "string",
+        "default": "openclaw"
       }
     },
     "additionalProperties": false
